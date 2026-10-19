@@ -1348,20 +1348,40 @@ function hexRgb(hex){
    linear decay is a full-scale strobe across 12.8% of the canvas (measured
    10,678 px per 140 ms at t=84); quantising that sweep alone only moved it to
    9,685, because the bar still moved 4 times per hit. So the bar steps ONCE per
-   hit to that hit's velocity (quantised to quarter steps) and drops to 0 in one
-   step once the channel has been quiet for HIT_WIN - the same "recently hit"
-   window the rest of the UI uses. The reading (which channel, how hard, still
-   live) survives; the sweep does not. */
+   hit to that hit's velocity and then HOLDS it. The reading (which channel, how
+   hard, still live) survives; the sweep does not.
+   Two things about that step still moved MORE than the sweep it replaced, both
+   measured at delta=0.5 s over the held frame pairs the suite decomposes:
+     - quarter steps sit right on the pixel-difference threshold. The bar's alpha
+       is 0.32+0.62*level, so a level change past ~0.21 repaints the WHOLE bar
+       instead of the newly exposed slice. Measured on the real canvas (kick,
+       bar 261x24 = 6,264 px): a 0.192 level change costs 1,224 px (the slice),
+       a 0.231 change costs 5,622 px (the bar). RM_METER_STEPS = 6 puts a
+       one-step change at 0.167, under the threshold, so a step moves a slice.
+     - the level cleared the instant the hit left HIT_WIN (0.45 s), so a channel
+       that plays in phrases blinked the full bar off and on again at every
+       phrase boundary (kick at t=121: hits every 0.26-0.39 s, then ~1 s of
+       rest): a 6,264 px snap twice per phrase, larger than the sweep it
+       replaced. The hold now survives RM_METER_HOLD of silence, which bridges
+       the gaps inside a phrase (measured 0.26-1.03 s there) and leaves only the
+       level steps. Still a hold, still discrete - never a sweep. */
+var RM_METER_HOLD = 1.2;     /* s of silence before a held level clears */
+var RM_METER_STEPS = 6;      /* quantisation of the held level (1 step = 0.167) */
 function rmMeterLevel(inst, t){
-  var a = hitAgeV(inst, t);
-  if (a < 0) return 0;
-  var q = Math.round(clamp01(lastHitVel(inst, t)) * 4) / 4;
-  /* A hit is a hit. A velocity below 0.125 used to quantise to level 0, so the
-     softest real hits drew NO bar in reduced mode while normal mode showed a
-     small one - the meter read "nothing happened". One quarter step is the
-     floor: still a held, quantised level (the sweep is what the tier removes,
-     not the readout). */
-  return (q < 0.25) ? 0.25 : q;
+  var i = instIdx(inst);
+  if (i < 0) return 0;
+  var n = EV_N[i];
+  if (!n) return 0;
+  var j = upperBound(EV_T[i], n, t) - 1;
+  if (j < 0) return 0;
+  if (t - EV_T[i][j] >= RM_METER_HOLD) return 0;
+  var q = Math.round(clamp01(EV_V[i][j]) * RM_METER_STEPS) / RM_METER_STEPS;
+  /* A hit is a hit. A velocity below half a step used to quantise to level 0, so
+     the softest real hits drew NO bar in reduced mode while normal mode showed a
+     small one - the meter read "nothing happened". One step is the floor: still
+     a held, quantised level (the sweep is what the tier removes, not the
+     readout). */
+  return (q < 1 / RM_METER_STEPS) ? 1 / RM_METER_STEPS : q;
 }
 function paintMixer(t){
   var M = paneMix, n = INSTR.length;
