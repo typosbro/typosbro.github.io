@@ -48,6 +48,28 @@
   #stats{position:absolute;right:10px;top:8px;font-size:10.5px;letter-spacing:.06em;color:var(--dim);
     background:rgba(3,5,14,.62);border:1px solid var(--line);border-radius:7px;padding:3px 8px;line-height:1.5;text-align:right;pointer-events:none}
   #stats b{color:var(--cyan);font-weight:600}
+  /* reduced motion: the only automatic UI transition is hover/press feedback;
+     the canvas side is handled in script (continuous + decorative motion off,
+     information - playhead, notes, key depression, readouts - stays on). */
+  @media (prefers-reduced-motion: reduce){ button{transition:none} }
+  /* phone portrait: the transport is the only DOM chrome that can overflow, so
+     it is packed into three rows - buttons + timecode, a full-width seek bar,
+     then the speed / mode segments - and every row stays inside the viewport.
+     Width only, so landscape desktop (1280x800 and up) is untouched. */
+  @media (max-width:620px){
+    #app{padding:4px 6px 6px;gap:3px}
+    header{padding:4px 7px;gap:6px}
+    #title{font-size:11.5px;max-width:44vw}
+    #artist{font-size:9.5px;max-width:42vw;overflow:hidden;text-overflow:ellipsis}
+    .chip{font-size:9px;letter-spacing:.05em;padding:2px 6px}
+    #controls{gap:6px;padding:4px 7px}
+    #btnPlay,#btnStop{order:1}
+    #tcode{order:1;margin-left:auto;min-width:0;font-size:10px}
+    #seekwrap{order:2;flex:1 1 100%;min-width:0;height:22px}
+    #speedSeg,#modeSeg{order:3}
+    button{font-size:10.5px;padding:5px 9px}
+    #stats{font-size:9.5px;padding:2px 6px}
+  }
 </style>
 </head>
 <body>
@@ -98,6 +120,12 @@
    AudioBufferSourceNode; the master clock is ctx.currentTime - startedAt.
    If that is unavailable (stub build / decode failure) the transport falls back
    to a performance.now() clock so the page is never a black screen.
+   Every visual is a PURE FUNCTION OF SONG TIME: hit ages, meter levels, head
+   wobble and pedal pose are derived from the event tables by binary search and
+   never accumulated frame to frame, so the same t renders the same pixels at
+   any frame rate (__ULTRA_RENDER_AT__) and a seek can never leave stale
+   effects behind. prefers-reduced-motion: reduce drops the continuous and
+   decorative motion (bloom, shimmer, wobble) and keeps the information.
    ========================================================================== */
 
 /* ---- 0. error capture / shared helpers ---------------------------------- */
@@ -119,7 +147,9 @@ var TAU = Math.PI * 2;
 function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
 function clamp01(v){ return v < 0 ? 0 : (v > 1 ? 1 : v); }
 function lerp(a, b, k){ return a + (b - a) * k; }
-function easeOut(t){ var u = 1 - t; return 1 - u * u * u; }
+function easeOut(t){ var u = 1 - t; return 1 - u * u * u; }   /* fast start, settles */
+function easeIn(t){ return t * t * t; }                     /* slow start, accelerates */
+function easeInOut(t){ var u = 1 - t; return t < 0.5 ? 4 * t * t * t : 1 - 4 * u * u * u; }
 function fmtTime(s){
   if (!isFinite(s) || s < 0) s = 0;
   var m = Math.floor(s / 60), r = s - m * 60;
@@ -142,6 +172,48 @@ function lowerBound(times, n, x){
   while (lo < hi){ var mid = (lo + hi) >> 1; if (times[mid] < x) lo = mid + 1; else hi = mid; }
   return lo;
 }
+
+/* ---- 0b. reduced motion --------------------------------------------------
+   prefers-reduced-motion: reduce removes CONTINUOUS motion and decoration: the
+   star shimmer, the drum blooms and expanding flash rings, the head and cymbal
+   wobble, the pedal spring, the pulsing next-section cue, the continuous scroll
+   of the piano roll and the continuous strobe of the hit meters. The playhead
+   is PINNED - the NOW line is fixed at the lane's left edge (state.playheadPx
+   == lane.x) and the note field moves past it - so "the playhead still moves"
+   was never true; the thing that moved was the largest area on the canvas. In
+   reduced mode the roll holds its window static and advances it in discrete
+   steps at bar boundaries (no optic flow between steps), the meters hold a
+   quantised level instead of sweeping, and the keyboard still depresses - a
+   discrete, informative pose - at half travel. Position stays legible from the
+   bar / beat / timecode readouts, the section and chord chips, the sounding
+   keys and the bar labels in the static window: reduced motion means less
+   movement, not a broken player.
+   The media query is re-read on change, so flipping the OS setting while the
+   page is open takes effect immediately; __ULTRA_REDUCED__(bool) forces it on
+   (or off, or back to auto with null) for testing. */
+var RM_MQ = null, RM_FORCE = null, RM_ON = false;
+function rmRead(){
+  var on;
+  if (RM_FORCE === null) on = RM_MQ ? !!RM_MQ.matches : false;
+  else on = RM_FORCE;
+  RM_ON = !!on;
+  return RM_ON;
+}
+function rmInit(){
+  try { RM_MQ = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null; }
+  catch(e){ RM_MQ = null; }
+  if (RM_MQ){
+    if (RM_MQ.addEventListener) RM_MQ.addEventListener('change', rmRead);
+    else if (RM_MQ.addListener) RM_MQ.addListener(rmRead);
+  }
+  rmRead();
+}
+window.__ULTRA_REDUCED__ = function(on){
+  if (on === undefined) return RM_ON;
+  RM_FORCE = (on === null || on === 'auto') ? null : !!on;
+  return rmRead();
+};
+rmInit();
 
 /* ---- 1. DOM handles ------------------------------------------------------ */
 var canvas = document.getElementById('stage');
@@ -225,6 +297,11 @@ var pT = new Float64Array(NP), pEnd = new Float64Array(NP);
 var pMidi = new Int16Array(NP), pVel = new Float32Array(NP), pHand = new Uint8Array(NP);
 var pClass = new Uint8Array(NP);
 var DATA_END = 0;
+/* longest note in the table. The roll's window query searches back this far
+   from the window's left edge, because no note can START earlier than that and
+   still be sounding - see queryRoll. Measured from the data, never hard-coded,
+   so a longer note in a future data set cannot silently fall out of the window. */
+var MAX_DUR = 0;
 (function buildPiano(){
   for (var i = 0; i < NP; i++){
     var n = DATA.piano[i];
@@ -236,29 +313,62 @@ var DATA_END = 0;
     pHand[i] = (n.hand === 'L') ? 1 : (n.hand === 'R') ? 2 : 0;
     pClass[i] = ((m % 12) + 12) % 12;
     if (pEnd[i] > DATA_END) DATA_END = pEnd[i];
+    if (d > MAX_DUR) MAX_DUR = d;
   }
 })();
 
-/* drum events -> structure-of-arrays + a per-instrument ephemeral hit list */
+/* drum events -> structure-of-arrays + per-instrument EVENT TIME tables.
+   The old design also kept HITS, a per-instrument "live hit" list that was
+   appended to and decay-culled every frame: it grew without bound while the
+   clock was frozen, it made hit visuals depend on frame history, and its
+   linear scans got more expensive the longer a timestamp was held. Every hit
+   query is now a binary search into EV_T/EV_V, so nothing is appended, culled
+   or deduped at runtime and the render path allocates nothing. */
 var INSTR = ['kick', 'snare', 'rim', 'clap', 'hihat', 'openhat', 'tom_hi', 'tom_mid', 'tom_lo', 'crash', 'ride', 'shaker'];
 var INST_IX = {};
 for (var ii = 0; ii < INSTR.length; ii++) INST_IX[INSTR[ii]] = ii;
 var INST_COL = ['#42f5ff', '#ff3ec8', '#ffe066', '#ff8a3d', '#ffc247', '#ffd98a', '#7cf6c8', '#6fe0ff', '#9a7bff', '#b9f4ff', '#ffb3e6', '#c9ff8a'];
+var INST_SHORT = ['KICK', 'SNR', 'RIM', 'CLAP', 'HH', 'OHH', 'T1', 'T2', 'T3', 'CRS', 'RIDE', 'SHK'];
 var ND = DATA.drums.length;
 var INST_COUNT = new Int32Array(INSTR.length);   /* events per instrument in the loaded data (must exist before buildDrums runs) */
 var dT = new Float64Array(ND), dInst = new Uint8Array(ND), dVel = new Float32Array(ND);
-var HITS = [];
+var EV_T = [], EV_V = [], EV_N = new Int32Array(INSTR.length);
 (function buildDrums(){
-  for (var k = 0; k < INSTR.length; k++) HITS.push({ t: new Float64Array(64), v: new Float32Array(64), n: 0 });
-  for (var i = 0; i < ND; i++){
-    var e = DATA.drums[i];
-    var t = +e.t; if (!isFinite(t)) t = 0;
-    dT[i] = t;
-    var ix = INST_IX[e.inst];
+  var i, k, e, t, ix, v, n, unsorted = 0;
+  for (k = 0; k < INSTR.length; k++){ EV_T.push(null); EV_V.push(null); }
+  for (i = 0; i < ND; i++){                       /* pass 1: exact per-instrument counts */
+    ix = INST_IX[DATA.drums[i].inst];
     if (ix !== undefined) INST_COUNT[ix]++;
+  }
+  for (k = 0; k < INSTR.length; k++){
+    EV_T[k] = new Float64Array(INST_COUNT[k]);
+    EV_V[k] = new Float32Array(INST_COUNT[k]);
+    EV_N[k] = 0;
+  }
+  for (i = 0; i < ND; i++){                       /* pass 2: fill (data is t-sorted) */
+    e = DATA.drums[i];
+    t = +e.t; if (!isFinite(t)) t = 0;
+    dT[i] = t;
+    ix = INST_IX[e.inst];
     dInst[i] = (ix === undefined) ? 255 : ix;
-    var v = +e.vel; dVel[i] = isFinite(v) ? clamp01(v) : 0.6;
+    v = +e.vel; dVel[i] = isFinite(v) ? clamp01(v) : 0.6;
+    if (ix !== undefined){
+      n = EV_N[ix];
+      if (n > 0 && t < EV_T[ix][n - 1]) unsorted = 1;
+      EV_T[ix][n] = t; EV_V[ix][n] = dVel[i]; EV_N[ix] = n + 1;
+    }
     if (t > DATA_END) DATA_END = t;
+  }
+  if (unsorted){                                  /* defensive: binary search needs order */
+    for (k = 0; k < INSTR.length; k++){
+      var A = EV_T[k], B = EV_V[k], m = EV_N[k], a, b;
+      for (a = 1; a < m; a++){
+        var at = A[a], av = B[a];
+        b = a - 1;
+        while (b >= 0 && A[b] > at){ A[b + 1] = A[b]; B[b + 1] = B[b]; b--; }
+        A[b + 1] = at; B[b + 1] = av;
+      }
+    }
   }
 })();
 
@@ -287,7 +397,15 @@ var secT = new Float64Array(SEC.length);
 for (var si = 0; si < SEC.length; si++) secT[si] = SEC[si].t;
 
 var DURATION = (isFinite(+META.duration) && +META.duration > 0.5) ? +META.duration : Math.max(DATA_END, 1) + 0.5;
-var SCORE_END = Math.max(DATA_END + 1.2, 1);
+/* SCORE_END is the end of the piece: the score's ring-out (last note + 1.2 s)
+   OR the real end of the audio, whichever is later. The two disagree - here the
+   score ends at 268.36 s while the decoded mp3 runs to 268.968 s - and stopping
+   at the score end made the last ~0.6 s of audio unreachable: pressing play at
+   or after SCORE_END - 0.03 reset the transport to 0. Every transport site
+   clamps with Math.min(DURATION, SCORE_END...), so taking the later of the two
+   lets the transport reach the true audio end and still never pass it (DURATION
+   is the decoded buffer length once the audio is ready). */
+var SCORE_END = Math.max(DATA_END + 1.2, DURATION, 1);
 
 /* instrument range -> which slice of the 88 keys we render */
 var KEY_LO = 21, KEY_HI = 108;
@@ -327,15 +445,31 @@ var rollStart = -1, rollCount = 0;
 var ACTIVE = [], ACTIVE_VEL = [];
 var KEY_AMP = new Float32Array(109);
 var KEY_ON = new Uint8Array(109);
+/* Key travel: 0 = up, 1 = fully down. KEY_DN is the note-on time of the OLDEST
+   still-sounding note on that pitch (so an overlapping second note does not
+   re-press a key that is already down) and KEY_OFF the most recent note-off
+   inside the scanned window - both read out of the note table, so the key
+   motion stays a pure function of t like everything else. */
+var KEY_DEPTH = new Float32Array(109);
+var KEY_DN = new Float64Array(109);
+var KEY_OFF = new Float64Array(109);
+var KEY_ATTACK = 0.030, KEY_RELEASE = 0.130;   /* fast down, slower release */
 var SEC_IX = -1, CHORD_IX = -1, CHORD_NAME = '';
 
-var PEDAL_KICK = 0, PEDAL_KICK_V = 0;
-var PEDAL_HAT = 0, PEDAL_HAT_V = 0;
-var HAT_OPEN = 0, HAT_RISE = 0;
+/* kit pose: rewritten every frame from the closed-form functions in section 8.
+   These are NOT integrators any more, so a seek can never leave a stale pedal,
+   bloom or wobble behind, and the damping no longer depends on frame rate. */
+var PEDAL_KICK = 0;
+var PEDAL_HAT = 0, HAT_OPEN = 0, HAT_RISE = 0;
 var CRASH_W = 0, RIDE_W = 0;
 var KICK_HEAD = 0, SNARE_HEAD = 0, TOM_W = [0, 0, 0];
+/* secondary action: the hardware (foot pedal, hi-hat rod, stands, tom mounts)
+   answers the piece it carries a few tens of ms later and with less travel. */
+var PEDAL_FOOT = 0, PEDAL_HAT_FOOT = 0, HAT_ROD = 0;
+var SWAY_TOM = 0, SWAY_SNARE = 0, SWAY_RIDE = 0, SWAY_CRASH = 0;
+var KICK_SQ = 0, SNARE_SQ = 0, TOM_SQ = [0, 0, 0];
+var PORTRAIT = false;
 var VU = new Float32Array(INSTR.length);
-var LAST_EV = new Int32Array(INSTR.length);
 
 var W = 0, H = 0, DPR = 1;
 var V = { time: 0, playing: false, speed: 1, mode: 'audio', audioOK: false };
@@ -376,7 +510,7 @@ function initAudioFromB64(){
     AUDIO.buf = buf; AUDIO.dur = buf.duration; AUDIO.state = 'ready';
     if (isFinite(AUDIO.dur) && AUDIO.dur > 1){
       DURATION = AUDIO.dur;
-      SCORE_END = Math.max(DATA_END + 1.2, 1);
+      SCORE_END = Math.max(DATA_END + 1.2, DURATION, 1);   /* reach the real audio end, never past it */
       drawSeekMarks();
     }
     elModeRead.textContent = trBackend();
@@ -454,9 +588,11 @@ function syncTransport(){
   trTick();
 }
 function clearLive(){
-  for (var i = 0; i < INSTR.length; i++){ HITS[i].n = 0; VU[i] = 0; }
+  /* Everything here is recomputed from the event tables on the next frame; the
+     kit pose is derived, not stored, so there is no spring state to reset. */
+  for (var i = 0; i < INSTR.length; i++) VU[i] = 0;
   ACTIVE.length = 0; ACTIVE_VEL.length = 0;
-  for (var m = 0; m < 109; m++){ KEY_ON[m] = 0; KEY_AMP[m] = 0; }
+  for (var m = 0; m < 109; m++){ KEY_ON[m] = 0; KEY_AMP[m] = 0; KEY_DEPTH[m] = 0; KEY_DN[m] = -1; KEY_OFF[m] = -1; }
 }
 function setPlaying(on){
   V.playing = !!on;
@@ -483,96 +619,140 @@ function seekTo(t){
 }
 
 /* ---- 5. queries: what is visible / sounding ------------------------------ */
+/* How long a drum hit stays "live". This is the same 0.45 s the old decay-cull
+   used, so bloom / flash / stick follow-through behave exactly as before - but
+   it is now a window into the event table instead of a list of live entries. */
+var HIT_WIN = 0.45;
 function queryRoll(t0, t1){
-  rollStart = lowerBound(pT, NP, t0);
-  rollCount = upperBound(pT, NP, t1) - rollStart;
-  if (rollCount < 0) rollCount = 0;
+  /* OVERLAP, not onset. A note belongs in the window when it STARTS before the
+     window's right edge AND ENDS at or after its left edge:
+         pT[i] <= t1  &&  pEnd[i] >= t0
+     The old form was onset-only - lowerBound(pT, t0) - so a sustained note was
+     dropped from the draw loop the moment its onset fell behind the window,
+     even while its body was still sounding inside the window: the block
+     vanished in one frame, mid-sound. pT is sorted, so the right edge is a
+     binary search; the left edge searches back one MAX_DUR, because no note can
+     start earlier than that and still be sounding at t0. That is O(log n + k)
+     against the 2263-note table instead of a full scan, and MAX_DUR comes from
+     the data, so a longer note in a future data set cannot fall out of it.
+     The returned range is a bounded SUPERSET of the overlap (the few notes
+     inside the back-search that ended before t0); the draw loop applies the
+     exact pEnd >= t0 test, so nothing is drawn that should not be. */
+  var lo = lowerBound(pT, NP, t0 - MAX_DUR);
+  var hi = upperBound(pT, NP, t1);
+  while (lo < hi && pEnd[lo] < t0) lo++;   /* trim the dead prefix, cheaply */
+  rollStart = lo;
+  rollCount = (hi > lo) ? (hi - lo) : 0;
 }
-function computeActive(){
+function computeActive(t){
   var k = 0, i = 0, m = 0;
-  var lo = lowerBound(pT, NP, V.time - 12);
-  var hi = upperBound(pT, NP, V.time);
-  for (m = 0; m < 109; m++){ KEY_ON[m] = 0; KEY_AMP[m] = 0; }
+  var lo = lowerBound(pT, NP, t - 12);
+  var hi = upperBound(pT, NP, t);
+  for (m = 0; m < 109; m++){ KEY_ON[m] = 0; KEY_AMP[m] = 0; KEY_DN[m] = -1; KEY_OFF[m] = -1; }
   ACTIVE.length = 0; ACTIVE_VEL.length = 0;
   for (i = lo; i < hi; i++){
-    if (pEnd[i] <= V.time) continue;
     m = pMidi[i];
+    if (pEnd[i] <= t){
+      if (m >= 21 && m <= 108 && pEnd[i] > KEY_OFF[m]) KEY_OFF[m] = pEnd[i];
+      continue;
+    }
     if (m >= 21 && m <= 108){
       KEY_ON[m] = 1;
       if (pVel[i] > KEY_AMP[m]) KEY_AMP[m] = pVel[i];
+      if (KEY_DN[m] < 0 || pT[i] < KEY_DN[m]) KEY_DN[m] = pT[i];
     }
     var found = 0;
     for (k = 0; k < ACTIVE.length; k++){ if (ACTIVE[k] === m){ found = 1; break; } }
     if (!found){ ACTIVE.push(m); ACTIVE_VEL.push(pVel[i]); }
   }
+  /* key travel: an ease-out attack (the finger lands fast, ~30 ms) and a longer
+     ease-out release (~130 ms). The old keyboard snapped between up and down on
+     the note boundary; a key is a lever with mass, so it travels. */
+  for (m = 0; m < 109; m++){
+    if (KEY_ON[m]){
+      KEY_DEPTH[m] = (KEY_DN[m] >= 0) ? easeOut(clamp01((t - KEY_DN[m]) / KEY_ATTACK)) : 1;
+    } else if (KEY_OFF[m] >= 0 && (t - KEY_OFF[m]) < KEY_RELEASE){
+      KEY_DEPTH[m] = 1 - easeOut(clamp01((t - KEY_OFF[m]) / KEY_RELEASE));
+    } else KEY_DEPTH[m] = 0;
+  }
 }
-function computeDrums(){
-  var i, inst, list, lo;
-  var now = V.time;
-  for (i = 0; i < INSTR.length; i++){ VU[i] *= 0.90; LAST_EV[i] = -1; }
-  var hi = upperBound(dT, ND, now + 0.004);
-  lo = lowerBound(dT, ND, now - 0.05);
-  for (i = hi - 1; i >= lo; i--){
-    inst = dInst[i];
-    if (inst === 255) continue;
-    if (LAST_EV[inst] < 0) LAST_EV[inst] = i;
-  }
-  for (i = lo; i < hi; i++){
-    inst = dInst[i];
-    if (inst === 255 || dT[i] > now) continue;
-    list = HITS[inst];
-    if (list.n >= list.t.length){                       /* grow (rare) */
-      var nt = new Float64Array(list.t.length * 2), nv = new Float32Array(list.v.length * 2);
-      nt.set(list.t); nv.set(list.v); list.t = nt; list.v = nv;
-    }
-    list.t[list.n] = dT[i]; list.v[list.n] = dVel[i]; list.n++;
-  }
-  for (i = 0; i < INSTR.length; i++){                   /* decay-cull in place */
-    list = HITS[i];
-    if (list.n === 0) continue;
-    var w = 0;
-    for (var r = 0; r < list.n; r++){
-      if (now - list.t[r] < 0.45){ list.t[w] = list.t[r]; list.v[w] = list.v[r]; w++; }
-    }
-    list.n = w;
-  }
+/* Per-instrument meter level at time t: 1 at the hit, straight line down to 0
+   over 0.26 s. Read out of the event table, so it is a pure function of t. The
+   old version decayed VU[i] by 0.90 per FRAME (frame-rate dependent: 120 Hz
+   damped twice as fast as 60 Hz) and ratcheted it up from a mutated hit list
+   (history dependent). */
+function computeDrums(t){
+  var i, j, n, a;
   for (i = 0; i < INSTR.length; i++){
-    var l2 = HITS[i];
-    if (l2.n > 0){
-      var snap = 1 - clamp01((now - l2.t[l2.n - 1]) / 0.26);
-      if (snap > VU[i]) VU[i] = snap;
-    }
+    n = EV_N[i];
+    j = n ? (upperBound(EV_T[i], n, t) - 1) : -1;
+    if (j < 0){ VU[i] = 0; continue; }
+    a = t - EV_T[i][j];
+    VU[i] = (a >= 0 && a < 0.26) ? (1 - a / 0.26) : 0;
   }
 }
-/* HITS is indexed by INSTR position, but call sites use instrument names: map
-   once here so both forms work (this guard is what keeps the kit animating). */
+/* how many instruments are inside the 0.45 s hit window at time t */
+function drumsActiveAt(t){
+  var i, n = 0;
+  for (i = 0; i < INSTR.length; i++){ if (hitIdxAt(i, t) >= 0) n++; }
+  return n;
+}
+/* The old code kept HITS, a mutated per-instrument "live hit" list that was
+   appended to and decay-culled every frame. It grew without bound while the
+   clock was frozen (the same event was re-appended forever because nothing
+   aged out), it cost an O(n) scan per query and an O(n) cull per frame, and it
+   made every hit visual depend on frame history. Hit state now comes straight
+   out of the per-instrument event table by binary search: O(log n),
+   allocation-free, and identical for a given t. */
 function instIdx(inst){
   if (typeof inst === 'number') return (inst >= 0 && inst < INSTR.length) ? inst : -1;
   var i = INST_IX[inst];
   return (i === undefined) ? -1 : i;
 }
-function lastHitIdx(inst){
+/* index of the most recent hit of inst at or before now, inside win. HIT_WIN is
+   the drum-visual window; the pedals have their own longer ones (PEDAL_WIN /
+   PEDAL_HAT_WIN) because their tails outlive the drum window and used to be cut
+   off mid-stroke - see pedalKickAt. */
+function hitIdxWin(inst, now, win){
   var i = instIdx(inst);
   if (i < 0) return -1;
-  var l = HITS[i];
-  if (!l || l.n === 0) return -1;
-  var bi = 0;
-  for (var k = 1; k < l.n; k++){ if (l.t[k] > l.t[bi]) bi = k; }
-  return bi;
+  var n = EV_N[i];
+  if (!n) return -1;
+  var j = upperBound(EV_T[i], n, now) - 1;
+  if (j < 0) return -1;
+  return (now - EV_T[i][j] < win) ? j : -1;
 }
-function hitAgeV(inst){
+function hitIdxAt(inst, now){ return hitIdxWin(inst, now, HIT_WIN); }
+function hitAgeWin(inst, now, win){
+  if (now === undefined) now = V.time;
+  var i = instIdx(inst);
+  var j = hitIdxWin(i, now, win);
+  return (j < 0) ? -1 : (now - EV_T[i][j]);
+}
+function hitAgeV(inst, now){
+  if (now === undefined) now = V.time;
+  var i = instIdx(inst);
+  var j = hitIdxAt(i, now);
+  return (j < 0) ? -1 : (now - EV_T[i][j]);
+}
+function lastHitVel(inst, now){
+  if (now === undefined) now = V.time;
+  var i = instIdx(inst);
+  var j = hitIdxAt(i, now);
+  return (j < 0) ? 0.8 : EV_V[i][j];
+}
+/* seconds until the NEXT hit of inst, or -1 when none lands inside win. This is
+   what gives the sticks their anticipation: the arm is already moving before
+   the strike frame, so a hit never appears out of nowhere. */
+function nextHitAt(inst, now, win){
   var i = instIdx(inst);
   if (i < 0) return -1;
-  var bi = lastHitIdx(i);
-  if (bi < 0) return -1;
-  var a = V.time - HITS[i].t[bi];
-  return (a >= 0 && a < 3) ? a : -1;
-}
-function lastHitVel(inst){
-  var i = instIdx(inst);
-  if (i < 0) return 0.8;
-  var bi = lastHitIdx(i);
-  return (bi < 0) ? 0.8 : HITS[i].v[bi];
+  var n = EV_N[i];
+  if (!n) return -1;
+  var j = upperBound(EV_T[i], n, now);
+  if (j >= n) return -1;
+  var d = EV_T[i][j] - now;
+  return (d >= 0 && d < win) ? d : -1;
 }
 function sectionAt(t){
   if (!SEC.length) return -1;
@@ -596,14 +776,55 @@ function resize(){
   var r = wrap.getBoundingClientRect();
   W = Math.max(320, Math.round(r.width));
   H = Math.max(240, Math.round(r.height));
-  DPR = clamp(window.devicePixelRatio || 1, 1, 2);
+  /* DPR: the desktop cap stays 2 (a 5K-wide backing store is not worth the
+     memory), but a narrow portrait viewport is small in device pixels, so a
+     dpr-3 phone gets its full 3x and the text stays sharp instead of blurred. */
+  DPR = clamp(window.devicePixelRatio || 1, 1, isPortraitWH(W, H) ? 3 : 2);
   canvas.width = Math.round(W * DPR);
   canvas.height = Math.round(H * DPR);
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   layout();
 }
+/* Portrait detection: a phone held upright is narrow and taller than wide.
+   Landscape desktop (1280x800 / 1440x900 / 2560x1440) is never portrait, so
+   this is false for every desktop target. */
+function isPortraitWH(w, h){
+  return (w < 620 && h > w * 0.90) || (h > w * 1.12);
+}
 function layout(){
   var pad = 8;
+  PORTRAIT = isPortraitWH(W, H);
+  if (PORTRAIT){
+    /* Phone portrait: one column. The roll owns the full width, the kit
+       collapses to a strip above it, the hit meters to a single 12-cell row and
+       the keyboard sits underneath. The landscape path below is unchanged. */
+    var q = 6;
+    var kbHp = clamp(H * 0.17, 76, 128);
+    var kbYp = H - kbHp;
+    kb.x = q; kb.y = kbYp; kb.w = W - q * 2; kb.h = kbHp - 2;
+    K.x = kb.x; K.y = kb.y; K.w = kb.w; K.h = kb.h;
+    K.ww = kb.w / Math.max(1, K.nWhite);
+    K.bw = K.ww * 0.60;
+    paneKit.x = q; paneKit.y = 6; paneKit.w = W - q * 2;
+    paneKit.h = clamp(H * 0.23, 96, 180);
+    paneMix.x = q; paneMix.y = paneKit.y + paneKit.h + 5; paneMix.w = paneKit.w;
+    paneMix.h = clamp(H * 0.065, 40, 52);
+    paneRoll.x = q; paneRoll.y = paneMix.y + paneMix.h + 5; paneRoll.w = paneKit.w;
+    paneRoll.h = Math.max(110, kbYp - 4 - paneRoll.y);
+    roll.x = paneRoll.x + 6; roll.y = paneRoll.y + STRIP_H; roll.w = paneRoll.w - 12;
+    roll.h = paneRoll.h - STRIP_H - 18;
+    lane.x = roll.x; lane.y = roll.y; lane.w = roll.w; lane.h = roll.h;
+    PXPS = lane.w / VIS_WINDOW;
+    bgGrad = null; bgRadial = null; gWhite.length = 0; gBlack.length = 0;
+    if (typeof placeCaptions === 'function') placeCaptions();
+    var availWp = paneKit.w - 24;
+    var availHp = paneKit.h - STRIP_H - 14;
+    kit.s = Math.min(availWp / 720, availHp / 480);
+    kit.cx = paneKit.x + 12 + availWp * 0.5 + 12 * kit.s;
+    kit.cy = paneKit.y + STRIP_H + 7 + availHp * 0.5 - 10 * kit.s;
+    drawSeekMarks();
+    return;
+  }
   var kbH = clamp(H * 0.20, 96, 210);
   var kbY = H - kbH;
   var paneT = 22;
@@ -645,9 +866,14 @@ var STAR_N = 64;
 var starX = new Float32Array(STAR_N), starY = new Float32Array(STAR_N);
 var starA = new Float32Array(STAR_N), starP = new Float32Array(STAR_N);
 (function initStars(){
+  /* Deterministic LCG (MINSTD) instead of Math.random(): the backdrop is part
+     of the rendered frame, so a given t has to hash the same across sessions
+     for video export. This is the only source of per-load pixel variance. */
+  var seed = 20250101;
+  function rnd(){ seed = (seed * 16807) % 2147483647; return seed / 2147483647; }
   for (var i = 0; i < STAR_N; i++){
-    starX[i] = Math.random(); starY[i] = Math.random();
-    starA[i] = 0.10 + Math.random() * 0.45; starP[i] = Math.random() * TAU;
+    starX[i] = rnd(); starY[i] = rnd();
+    starA[i] = 0.10 + rnd() * 0.45; starP[i] = rnd() * TAU;
   }
 })();
 function roundRect(x, y, w, h, r){
@@ -683,7 +909,9 @@ function paintBackdrop(t){
   ctx.fillStyle = bgRadial; ctx.fillRect(0, 0, W, H);
   ctx.save();
   for (var i = 0; i < STAR_N; i++){
-    var a = starA[i] * (0.55 + 0.45 * Math.sin(t * 0.9 + starP[i]));
+    /* the starfield shimmer is pure decoration: frozen, not removed, under
+       reduced motion (the field itself stays, it just stops twinkling) */
+    var a = RM_ON ? (starA[i] * 0.8) : (starA[i] * (0.55 + 0.45 * Math.sin(t * 0.9 + starP[i])));
     ctx.fillStyle = (i % 5 === 0) ? 'rgba(255,62,200,' + a.toFixed(3) + ')' : 'rgba(170,225,255,' + a.toFixed(3) + ')';
     ctx.fillRect(starX[i] * W, starY[i] * H, 1.6, 1.6);
   }
@@ -722,7 +950,9 @@ function paintBackdrop(t){
     var nt = SEC[SEC_IX + 1].t - t;
     if (nt < 4 && nt > 0){
       ctx.textAlign = 'right';
-      ctx.fillStyle = 'rgba(255,194,71,' + (0.45 + 0.45 * Math.abs(Math.sin(nt * 3))).toFixed(3) + ')';
+      /* the pulsing "next section" cue is the only blinking readout: hold it
+         at a steady value under reduced motion instead of strobing */
+      ctx.fillStyle = 'rgba(255,194,71,' + (RM_ON ? '0.72' : (0.45 + 0.45 * Math.abs(Math.sin(nt * 3))).toFixed(3)) + ')';
       ctx.fillText('NEXT ' + (SEC[SEC_IX + 1].name || '').toUpperCase() + ' IN ' + nt.toFixed(1) + 's', paneRoll.x + paneRoll.w - 10, paneRoll.y + 16);
     }
   }
@@ -849,56 +1079,207 @@ function placeCaptions(){
   if (CAPTION_FAILS) UERR('caption placement: ' + CAPTION_FAILS + ' caption(s) had no clear slot');
 }
 placeCaptions();
-function hitPulse(inst, dur){
-  var a = hitAgeV(inst);
+function hitPulse(inst, dur, now){
+  var a = hitAgeV(inst, now);
   if (a < 0 || a > dur) return 0;
-  return Math.exp(-a * 6.5) * (0.72 + 0.28 * lastHitVel(inst));
+  /* weighted by hit velocity: a ghost note barely lights up, an accent blazes */
+  return Math.exp(-a * 6.5) * (0.34 + 0.76 * lastHitVel(inst, now));
 }
-/* short bloom behind a piece so the kit alone shows which drum just fired */
+/* ---- pure kit physics ----------------------------------------------------
+   Time constants, not per-frame multipliers: 0.90 per 60 fps frame is
+   exp(-6.32 * age) in seconds, so the damping is the same at 30, 60 or 120 Hz.
+   Every value below is a closed-form function of the age of the most recent
+   hit for that instrument - none of them is integrated across frames, so the
+   kit at song time t is the same picture however you arrived at t. */
+var DECAY_90 = 6.32;                       /* 1/s, == 0.90 per 60 fps frame */
+/* Per-instrument MATERIAL - it is the material, not a style choice, that
+   decides how a piece deforms. dec = how fast the deformation dies (1/s),
+   amp = how far it goes, sq = contact squash for a MEMBRANE (a head flattens
+   under the stick and bulges sideways), tilt = rock amplitude for METAL (a
+   cymbal cannot stretch). Heavy = slow and deep (kick), light = fast and
+   shallow (hi-hat, the lightest piece in the kit). */
+var MEMB = {
+  kick:    { dec: 3.60, amp: 1.00, sq: 0.150, tilt: 0     },
+  snare:   { dec: 8.60, amp: 0.60, sq: 0.080, tilt: 0     },
+  tom_hi:  { dec: 9.80, amp: 0.42, sq: 0.062, tilt: 0     },
+  tom_mid: { dec: 8.20, amp: 0.52, sq: 0.078, tilt: 0     },
+  tom_lo:  { dec: 6.00, amp: 0.68, sq: 0.098, tilt: 0     },
+  hihat:   { dec: 12.0, amp: 0.30, sq: 0,     tilt: 0.120 },
+  crash:   { dec: 6.40, amp: 0.85, sq: 0,     tilt: 0.150 },
+  ride:    { dec: 8.80, amp: 0.55, sq: 0,     tilt: 0.090 }
+};
+var MEMB_DEF = { dec: 8.60, amp: 0.60, sq: 0.080, tilt: 0 };
+function membOf(inst){ return MEMB[inst] || MEMB_DEF; }
+function headWobAt(inst, now){
+  var a = hitAgeV(inst, now);
+  if (a < 0) return 0;
+  var m = membOf(inst);
+  /* the same edge as the pedal: at a = HIT_WIN the kick mode is still at 0.20 of
+     its amplitude, and cutting it there popped the head outline. The last
+     120 ms of the window is a smoothstep to 0, so the pose is continuous. */
+  var e = clamp01((HIT_WIN - a) / 0.12);
+  return lastHitVel(inst, now) * m.amp * Math.exp(-a * m.dec) * e * e * (3 - 2 * e);
+}
+/* contact squash: a membrane flattens the instant it is struck and springs
+   back in ~0.1 s. Metal has sq = 0 and never enters this path. */
+function squashAt(inst, now){
+  var m = membOf(inst);
+  if (m.sq <= 0) return 0;
+  var a = hitAgeV(inst, now);
+  if (a < 0 || a > 0.20) return 0;
+  return m.sq * lastHitVel(inst, now) * Math.exp(-a * 15.0);
+}
+/* The pedal's tail outlives HIT_WIN: exp(-4.2a)cos(6a) is still at -0.06 when
+   a = 0.45, so cutting it at the drum window snapped the beater - and the board
+   under the foot 36 ms later - by ~2.7 deg in a single frame. The pedal gets
+   its own longer window and a smooth edge: full strength through the stroke,
+   then a smoothstep to exactly 0 at PEDAL_WIN, so the pose is continuous
+   everywhere, boundary included. */
+var PEDAL_WIN = 0.62, PEDAL_EDGE = 0.18;
+function pedalWin(a, win, edge){
+  var u = clamp01((win - a) / edge);
+  return u * u * (3 - 2 * u);
+}
+/* The foot drives THROUGH the strike. The old form peaked at a = 0 with
+   amp = 0.55 + 0.8*vel = 1.35 at vel 1.0, so an accent sat pinned on the 1.05
+   clamp for the whole first 40 ms: the heaviest hit was the one with no motion.
+   The pedal now reaches full travel 40 ms after contact, scaled so a
+   full-velocity accent peaks at 1.03 - just under the clamp - and the value is
+   strictly increasing over 0 <= a <= 0.04. */
+var PEDAL_ATT = 0.04, PEDAL_AMP = 1.25;
+function pedalKickAt(now){
+  var a = hitAgeWin('kick', now, PEDAL_WIN);
+  if (a < 0) return 0;
+  var amp = PEDAL_AMP * (0.47 + 0.53 * lastHitVel('kick', now));
+  var drive = 0.78 + 0.22 * clamp01(a / PEDAL_ATT);
+  return clamp(amp * drive * Math.exp(-a * 4.2) * Math.cos(a * 6.0) * pedalWin(a, PEDAL_WIN, PEDAL_EDGE), -0.06, 1.05);
+}
+function hatOpenAt(now){
+  var a = hitAgeV('openhat', now);
+  if (a < 0) return 0;
+  /* fast eased lift, hold, then a slower close: the old version stepped to 1
+     on the hit frame, which is what made the hat look like it teleported. */
+  var rise = easeOut(clamp01(a / 0.035));
+  var fall = (a < 0.26) ? 1 : Math.exp(-(a - 0.26) * DECAY_90);
+  return rise * ((fall > 0.02) ? fall : 0);
+}
+function hatRiseAt(now){
+  var a = hitAgeV('openhat', now);
+  if (a < 0) return 0;
+  var v = easeOut(clamp01(a / 0.025)) * Math.exp(-a * 4.36);
+  return (v > 0.02) ? v : 0;
+}
+/* The hi-hat board had the same edge as the kick (its tail is still at 0.61 of
+   its travel at a = 0.45), so it gets the same treatment with its own window.
+   The openhat branch is DELETED, not fixed: it computed v0 = -1.0, which made
+   the whole expression negative and clamp(...,0,1) return 0 for every age -
+   identical to "no hit", so it was dead code pretending to be a pose. An open
+   hat is a FOOT action and the foot's work is already carried by HAT_OPEN /
+   HAT_RISE (the top disc lift) and HAT_ROD; the data has no openhat events, so
+   nothing observable changes. */
+var PEDAL_HAT_WIN = 0.75, PEDAL_HAT_EDGE = 0.25;
+function pedalHatAt(now){
+  var a = hitAgeWin('hihat', now, PEDAL_HAT_WIN);
+  if (a < 0) return 0;
+  return clamp(0.8 * 0.85 * (1 - Math.exp(-13.4 * a)) * Math.exp(-a * 1.1)
+               * pedalWin(a, PEDAL_HAT_WIN, PEDAL_HAT_EDGE), 0, 1);
+}
+/* ---- secondary action ----------------------------------------------------
+   Hardware does not move with the piece it carries: it answers a few tens of ms
+   later and with less travel. Closed-form in song time, so a seek lands on the
+   same pose as playback would. */
+var LAG_FOOT = 0.036, LAG_ROD = 0.022, LAG_HW = 0.040;
+function hardwareAt(inst, now, amt){
+  var tn = now - LAG_HW;
+  var a = hitAgeV(inst, tn);
+  if (a < 0 || a > 0.32) return 0;
+  return amt * lastHitVel(inst, tn) * Math.exp(-a * 7.0);
+}
+/* ---- stick swing: anticipation, strike, follow-through -------------------
+   One closed-form pose per instrument, still a pure function of song time.
+     wind-up   the tip lifts away from the contact pose ANT seconds before the
+               strike and holds the top of the stroke for a moment
+     strike    the last STICK_HIT before the hit is an EASE-OUT: a real stroke
+               is fastest at the head, so it is never linear, and contact lands
+               ON the hit frame - the frame the drum actually sounds
+     rebound   the head throws the stick back fast, it overshoots past the rest
+               pose and settles: that is the follow-through
+   1 = contact, 0 = rest, negative = lifted past rest. */
+var STICK_ANT = 0.075, STICK_HIT = 0.050, STICK_REC = 0.26, STICK_LIFT = 0.34;
+function stickSwingAt(inst, now){
+  var a = hitAgeV(inst, now);                             /* age of the last hit */
+  var b = nextHitAt(inst, now, STICK_ANT + STICK_HIT);    /* time to the next hit */
+  var post = 0, w = 0;
+  if (a >= 0){
+    var rec = STICK_REC;
+    if (b >= 0){
+      var room = a + b - STICK_ANT;                       /* room before the next wind-up */
+      if (room < rec) rec = Math.max(0.04, room);
+    }
+    if (a < rec){
+      var u = a / rec;
+      post = (1 - easeOut(u)) - 0.22 * Math.sin(Math.PI * u) * Math.exp(-3.0 * u);
+    }
+    if (b >= 0 && b < STICK_ANT) w = easeOut(1 - b / STICK_ANT);
+    return post * (1 - w) - STICK_LIFT * w;
+  }
+  if (b < 0) return 0;                                    /* nothing imminent: at rest */
+  if (b <= STICK_HIT) return lerp(-STICK_LIFT, 1, easeOut(1 - b / STICK_HIT));
+  if (b < STICK_ANT + STICK_HIT) return -STICK_LIFT * easeOut(1 - (b - STICK_HIT) / STICK_ANT);
+  return 0;
+}
+/* short bloom behind a piece so the kit alone shows which drum just fired.
+   Continuous/decorative: dropped under reduced motion (the piece still scales
+   and glows on the hit, so which drum fired is still legible). */
 function hitBloom(x, y, r, inst, t){
-  var a = hitAgeV(inst);
+  if (RM_ON) return;
+  var a = hitAgeV(inst, t);
   if (a < 0 || a > 0.34) return;
+  var v = lastHitVel(inst, t);
   var e = 1 - a / 0.34;
   var col = INST_COL[INST_IX[inst]];
+  /* weighted by hit velocity: a soft hit barely glows, an accent blooms wide */
+  var rr = r * (1.10 + 0.60 * (1 - e)) * (0.86 + 0.14 * v);
   ctx.save();
-  ctx.globalAlpha = 0.42 * e * e;
-  var g = ctx.createRadialGradient(x, y, r * 0.35, x, y, r * (1.15 + 0.55 * (1 - e)));
+  ctx.globalAlpha = 0.46 * e * e * (0.28 + 0.72 * v);
+  var g = ctx.createRadialGradient(x, y, r * 0.35, x, y, rr);
   g.addColorStop(0, 'rgba(255,255,255,0.85)');
   g.addColorStop(0.45, col);
   g.addColorStop(1, 'rgba(0,0,0,0)');
   ctx.fillStyle = g;
-  ctx.beginPath(); ctx.arc(x, y, r * (1.15 + 0.55 * (1 - e)), 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.arc(x, y, rr, 0, TAU); ctx.fill();
   ctx.restore();
 }
 function paintKit(t){
   var s = kit.s;
-  /* --- physics --- */
-  var ka = hitAgeV('kick');
-  if (ka >= 0 && ka < 0.02) PEDAL_KICK_V = 0.55 + 0.8 * lastHitVel('kick');
-  PEDAL_KICK_V += (-PEDAL_KICK * 38) * 0.9;
-  PEDAL_KICK_V *= 0.90; PEDAL_KICK += PEDAL_KICK_V;
-  PEDAL_KICK = clamp(PEDAL_KICK, -0.06, 1.05);
-  if (PEDAL_KICK < 0){ PEDAL_KICK *= 0.75; PEDAL_KICK_V *= 0.5; }
-  var oa = hitAgeV('openhat');
-  if (oa >= 0 && oa < 0.26) HAT_OPEN = 1; else HAT_OPEN *= 0.90;
-  if (oa >= 0 && oa < 0.02){ HAT_RISE = 1; PEDAL_HAT_V = -1.0; }
-  var ha = hitAgeV('hihat');
-  if (ha >= 0 && ha < 0.02){ PEDAL_HAT_V = 0.85; HAT_RISE = 0; }
-  PEDAL_HAT += PEDAL_HAT_V * 0.16; PEDAL_HAT_V *= 0.80;
-  PEDAL_HAT = clamp(PEDAL_HAT - HAT_OPEN * 0.04, 0, 1);
-  HAT_RISE *= 0.93;
-  var k1 = hitAgeV('kick');
-  KICK_HEAD = (k1 >= 0 && k1 < 0.04) ? lastHitVel('kick') : KICK_HEAD * 0.90;
-  var s1 = hitAgeV('snare');
-  SNARE_HEAD = (s1 >= 0 && s1 < 0.04) ? lastHitVel('snare') : SNARE_HEAD * 0.90;
-  var tomNames = ['tom_hi', 'tom_mid', 'tom_lo'];
-  for (var ti = 0; ti < 3; ti++){
-    var ta = hitAgeV(tomNames[ti]);
-    TOM_W[ti] = (ta >= 0 && ta < 0.04) ? lastHitVel(tomNames[ti]) : TOM_W[ti] * 0.90;
-  }
-  var ca = hitAgeV('crash'), ra = hitAgeV('ride');
-  CRASH_W = (ca >= 0 && ca < 0.04) ? lastHitVel('crash') : CRASH_W * 0.90;
-  RIDE_W = (ra >= 0 && ra < 0.04) ? lastHitVel('ride') : RIDE_W * 0.90;
+  /* --- pose: derived, never integrated. The old version mutated this state
+     inside the paint function, so reordering the paint calls - or calling
+     paintKit twice - silently changed the animation rate. --- */
+  PEDAL_KICK = pedalKickAt(t);
+  HAT_OPEN = hatOpenAt(t);
+  HAT_RISE = hatRiseAt(t);
+  PEDAL_HAT = pedalHatAt(t);
+  KICK_HEAD = headWobAt('kick', t);
+  SNARE_HEAD = headWobAt('snare', t);
+  TOM_W[0] = headWobAt('tom_hi', t);
+  TOM_W[1] = headWobAt('tom_mid', t);
+  TOM_W[2] = headWobAt('tom_lo', t);
+  CRASH_W = headWobAt('crash', t);
+  RIDE_W = headWobAt('ride', t);
+  /* secondary action: the foot, the rod and the stands answer the piece they
+     carry 22-40 ms later and travel 15-30% less */
+  PEDAL_FOOT = pedalKickAt(t - LAG_FOOT) * 0.85;
+  PEDAL_HAT_FOOT = pedalHatAt(t - LAG_FOOT) * 0.80;
+  HAT_ROD = (hatOpenAt(t - LAG_ROD) * 0.30 + hatRiseAt(t - LAG_ROD) * 0.10) * 0.72;
+  SWAY_TOM = hardwareAt('tom_lo', t, 2.2);
+  SWAY_SNARE = hardwareAt('snare', t, 2.4);
+  SWAY_RIDE = hardwareAt('ride', t, 2.6);
+  SWAY_CRASH = hardwareAt('crash', t, 2.8);
+  KICK_SQ = squashAt('kick', t);
+  SNARE_SQ = squashAt('snare', t);
+  TOM_SQ[0] = squashAt('tom_hi', t);
+  TOM_SQ[1] = squashAt('tom_mid', t);
+  TOM_SQ[2] = squashAt('tom_lo', t);
 
   paintMixer(t);
 
@@ -908,14 +1289,14 @@ function paintKit(t){
   ctx.clip();
   ctx.translate(kit.cx, kit.cy);
   ctx.scale(s, s);
-  var kp = hitPulse('kick', 0.28), sp = hitPulse('snare', 0.26),
-      hp = Math.max(hitPulse('hihat', 0.22), hitPulse('openhat', 0.28)),
-      cp = hitPulse('crash', 0.42), rp = hitPulse('ride', 0.36);
-  var tp = [hitPulse('tom_hi', 0.26), hitPulse('tom_mid', 0.26), hitPulse('tom_lo', 0.26)];
-  stand(KIT.tom_lo.x, KIT.tom_lo.y + KIT.tom_lo.r * 0.5, FLOOR, 26, 3);
-  stand(KIT.snare.x, KIT.snare.y + KIT.snare.r * 0.7, FLOOR, 24, 3);
-  stand(KIT.ride.x - 14, KIT.ride.y + 12, FLOOR, 30, 3.2);
-  stand(KIT.crash.x + 14, KIT.crash.y + 10, FLOOR, 28, 3.2);
+  var kp = hitPulse('kick', 0.28, t), sp = hitPulse('snare', 0.26, t),
+      hp = Math.max(hitPulse('hihat', 0.22, t), hitPulse('openhat', 0.28, t)),
+      cp = hitPulse('crash', 0.42, t), rp = hitPulse('ride', 0.36, t);
+  var tp = [hitPulse('tom_hi', 0.26, t), hitPulse('tom_mid', 0.26, t), hitPulse('tom_lo', 0.26, t)];
+  stand(KIT.tom_lo.x, KIT.tom_lo.y + KIT.tom_lo.r * 0.5, FLOOR, 26, 3, SWAY_TOM);
+  stand(KIT.snare.x, KIT.snare.y + KIT.snare.r * 0.7, FLOOR, 24, 3, SWAY_SNARE);
+  stand(KIT.ride.x - 14, KIT.ride.y + 12, FLOOR, 30, 3.2, SWAY_RIDE);
+  stand(KIT.crash.x + 14, KIT.crash.y + 10, FLOOR, 28, 3.2, SWAY_CRASH);
   ctx.strokeStyle = 'rgba(126,158,205,0.5)'; ctx.lineWidth = 3.4; ctx.lineCap = 'round';
   ctx.beginPath();
   ctx.moveTo(KIT.kick.x - KIT.kick.r * 0.72, KIT.kick.y + KIT.kick.r * 0.5);
@@ -931,11 +1312,18 @@ function paintKit(t){
   drawHiHat(KIT.hihat, t, hp);
   drawCymbal(KIT.crash, 'crash', t, -0.11, 1, cp);
   drawCymbal(KIT.ride, 'ride', t, 0.09, 0, rp);
-  ctx.font = '700 13px ui-monospace,Menlo,Consolas,monospace';
-  ctx.textAlign = 'center';
-  for (var key in KIT){
-    var cp = CAPTION_POS[key] || { x: KIT[key].cap[0], y: KIT[key].cap[1] };
-    caption(cp.x, cp.y, KIT[key].name);
+  /* Captions live in kit DESIGN space, so their screen size scales with the
+     kit: under ~0.34 scale a 13 px caption is below 4.5 px on screen - a smudge,
+     not a label - so the portrait strip drops them (the HIT METERS row directly
+     below names every instrument). Placement and clearance are still computed
+     for every viewport, so kitGeom.captionWorstClearance keeps its meaning. */
+  if (s >= 0.34){
+    ctx.font = '700 13px ui-monospace,Menlo,Consolas,monospace';
+    ctx.textAlign = 'center';
+    for (var key in KIT){
+      var cp = CAPTION_POS[key] || { x: KIT[key].cap[0], y: KIT[key].cap[1] };
+      caption(cp.x, cp.y, KIT[key].name);
+    }
   }
   ctx.restore();
 }
@@ -956,8 +1344,62 @@ function hexRgb(hex){
   c = [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
   _rgbCache[hex] = c; return c;
 }
+/* reduced motion: the meters become a PEAK HOLD instead of a sweep. A 0.26 s
+   linear decay is a full-scale strobe across 12.8% of the canvas (measured
+   10,678 px per 140 ms at t=84); quantising that sweep alone only moved it to
+   9,685, because the bar still moved 4 times per hit. So the bar steps ONCE per
+   hit to that hit's velocity (quantised to quarter steps) and drops to 0 in one
+   step once the channel has been quiet for HIT_WIN - the same "recently hit"
+   window the rest of the UI uses. The reading (which channel, how hard, still
+   live) survives; the sweep does not. */
+function rmMeterLevel(inst, t){
+  var a = hitAgeV(inst, t);
+  if (a < 0) return 0;
+  var q = Math.round(clamp01(lastHitVel(inst, t)) * 4) / 4;
+  /* A hit is a hit. A velocity below 0.125 used to quantise to level 0, so the
+     softest real hits drew NO bar in reduced mode while normal mode showed a
+     small one - the meter read "nothing happened". One quarter step is the
+     floor: still a held, quantised level (the sweep is what the tier removes,
+     not the readout). */
+  return (q < 0.25) ? 0.25 : q;
+}
 function paintMixer(t){
   var M = paneMix, n = INSTR.length;
+  if (PORTRAIT){
+    /* portrait: the 2-column landscape grid cannot fit a 40-50 px strip, so the
+       meters become one row of 12 cells. Same readout, same dimming of silent
+       channels, a third of the height. */
+    ctx.save();
+    ctx.beginPath(); roundRect(M.x, M.y, M.w, M.h, 7);
+    ctx.fillStyle = 'rgba(8,12,26,0.55)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(120,190,255,0.18)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = 'rgba(255,194,71,0.95)';
+    ctx.fillRect(M.x + 7, M.y + 5, 3, 7);
+    ctx.font = '700 9px ui-monospace,Menlo,Consolas,monospace';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(198,220,250,0.92)';
+    ctx.fillText('HIT METERS', M.x + 14, M.y + 11.5);
+    var cw = (M.w - 14) / n;
+    var barY = M.y + 25, barH = Math.max(5, M.h - 29);
+    for (var pi = 0; pi < n; pi++){
+      var px0 = M.x + 7 + pi * cw;
+      var pv = RM_ON ? rmMeterLevel(pi, t) : clamp01(VU[pi]);
+      var plive = INST_COUNT[pi] > 0;
+      ctx.font = '600 8px ui-monospace,Menlo,Consolas,monospace';
+      ctx.fillStyle = !plive ? 'rgba(105,122,155,0.34)' : (pv > 0.25 ? '#eaf6ff' : 'rgba(125,144,184,0.8)');
+      ctx.fillText(INST_SHORT[pi], px0, barY - 3);
+      ctx.fillStyle = plive ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.018)';
+      ctx.fillRect(px0, barY, cw - 3, barH);
+      if (plive && pv > 0.02){
+        ctx.fillStyle = withA(hexRgb(INST_COL[pi]), 0.32 + 0.62 * pv);
+        ctx.fillRect(px0, barY, (cw - 3) * pv, barH);
+        ctx.fillStyle = 'rgba(255,255,255,' + (0.35 * pv).toFixed(3) + ')';
+        ctx.fillRect(px0, barY, (cw - 3) * pv, 1.4);
+      }
+    }
+    ctx.restore();
+    return;
+  }
   panelChrome(M, 'HIT METERS', 'rgba(255,194,71,0.95)');
   ctx.save();
   var rowH = (M.h - 30) / n;
@@ -965,7 +1407,7 @@ function paintMixer(t){
   for (var i = 0; i < n; i++){
     var cx0 = M.x + 10 + (i % 2) * colW;
     var y = M.y + 26 + Math.floor(i / 2) * rowH * 2;
-    var v = clamp01(VU[i]);
+    var v = RM_ON ? rmMeterLevel(i, t) : clamp01(VU[i]);
     var live = INST_COUNT[i] > 0;
     ctx.font = '600 9px ui-monospace,Menlo,Consolas,monospace';
     ctx.textAlign = 'left';
@@ -983,16 +1425,20 @@ function paintMixer(t){
   }
   ctx.restore();
 }
-function stand(x, yTop, yBot, spread, lw){
+/* sway (design units) is the SECONDARY ACTION of the hardware: the top of the
+   stand bends a few tens of ms after the piece it carries, the feet barely move. */
+function stand(x, yTop, yBot, spread, lw, sway){
+  if (!sway) sway = 0;
+  var xf = x + sway * 0.35;
   ctx.strokeStyle = 'rgba(126,158,205,0.55)';
   ctx.lineWidth = lw;
-  ctx.beginPath(); ctx.moveTo(x, yTop); ctx.lineTo(x, yBot); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x + sway, yTop); ctx.lineTo(xf, yBot); ctx.stroke();
   ctx.lineWidth = Math.max(1, lw * 0.75);
-  ctx.beginPath(); ctx.moveTo(x, yBot - spread * 0.9); ctx.lineTo(x - spread, yBot + spread * 0.5); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(x, yBot - spread * 0.9); ctx.lineTo(x + spread, yBot + spread * 0.5); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(x, yBot - spread * 0.9); ctx.lineTo(x + spread * 0.2, yBot + spread * 0.62); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(xf, yBot - spread * 0.9); ctx.lineTo(xf - spread, yBot + spread * 0.5); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(xf, yBot - spread * 0.9); ctx.lineTo(xf + spread, yBot + spread * 0.5); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(xf, yBot - spread * 0.9); ctx.lineTo(xf + spread * 0.2, yBot + spread * 0.62); ctx.stroke();
   ctx.fillStyle = 'rgba(150,185,235,0.28)';
-  ctx.beginPath(); ctx.ellipse(x, yBot + spread * 0.5, spread * 1.5, spread * 0.34, 0, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(xf, yBot + spread * 0.5, spread * 1.5, spread * 0.34, 0, 0, TAU); ctx.fill();
 }
 function shellBody(x, y, r, depth, tone, rimGlow){
   ctx.save();
@@ -1023,13 +1469,16 @@ function shellBody(x, y, r, depth, tone, rimGlow){
   }
   ctx.restore();
 }
+/* expanding ring on a hit - decorative, dropped under reduced motion */
 function flashRing(x, y, r, inst, t){
-  var a = hitAgeV(inst);
+  if (RM_ON) return;
+  var a = hitAgeV(inst, t);
   if (a < 0 || a > 0.34) return;
+  var v = lastHitVel(inst, t);
   var k = a / 0.34, e = 1 - k;
-  var rr = r * (0.72 + 1.55 * easeOut(k));
+  var rr = r * (0.72 + 1.55 * easeOut(k)) * (0.86 + 0.14 * v);
   ctx.save();
-  ctx.globalAlpha = e * e * 0.95;
+  ctx.globalAlpha = e * e * (0.30 + 0.70 * v);
   ctx.strokeStyle = INST_COL[INST_IX[inst]];
   ctx.lineWidth = (4.2 * e + 0.8) / Math.max(0.35, kit.s);
   ctx.shadowColor = INST_COL[INST_IX[inst]];
@@ -1037,14 +1486,18 @@ function flashRing(x, y, r, inst, t){
   ctx.beginPath(); ctx.arc(x, y, rr, 0, TAU); ctx.stroke();
   ctx.restore();
 }
-function fillHead(x, y, r, wob, ph, tone, rim, glow, vel){
+/* A drum head is a MEMBRANE: on impact it flattens along the strike axis and
+   bulges sideways (roughly volume preserving), then springs back. sq comes
+   from squashAt() and is 0 for every metal piece. */
+function fillHead(x, y, r, wob, ph, tone, rim, glow, vel, sq){
   ctx.save();
   ctx.beginPath();
   var N = 26;
+  var sx = 1 + sq * 0.45, sy = 1 - sq * 0.70;
   for (var i = 0; i <= N; i++){
     var a = i / N * TAU;
     var rr = r * (1 + wob * 0.055 * Math.sin(a * 5 + ph) + wob * 0.03 * Math.sin(a * 3 - ph * 1.7));
-    var px = x + Math.cos(a) * rr, py = y + Math.sin(a) * rr * 0.94;
+    var px = x + Math.cos(a) * rr * sx, py = y + Math.sin(a) * rr * 0.94 * sy;
     if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
   }
   ctx.closePath();
@@ -1059,7 +1512,7 @@ function fillHead(x, y, r, wob, ph, tone, rim, glow, vel){
   ctx.shadowBlur = 0;
   ctx.globalAlpha = 0.16 + 0.4 * vel;
   ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1.2;
-  ctx.beginPath(); ctx.ellipse(x, y, r * 0.7, r * 0.66, 0, 0, TAU); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(x, y, r * 0.7 * sx, r * 0.66 * sy, 0, 0, TAU); ctx.stroke();
   ctx.restore();
 }
 function stick(x, y, ang, len, wdt, col){
@@ -1073,23 +1526,30 @@ function stick(x, y, ang, len, wdt, col){
 }
 function drawKick(P, t, pulse){
   var r = P.r, x = P.x, y = P.y;
-  var a = hitAgeV('kick');
-  var vel = (a >= 0 && a < 0.26) ? lastHitVel('kick') * (1 - a / 0.26) : 0;
+  var a = hitAgeV('kick', t);
+  var vel = (a >= 0 && a < 0.26) ? lastHitVel('kick', t) * (1 - a / 0.26) : 0;
   var col = INST_COL[INST_IX['kick']];
-  var wob = KICK_HEAD * Math.exp(-KICK_HEAD * 4) * (0.4 + 0.6 * Math.sin(t * 46));
+  /* the head ripple is a decaying mode locked to the strike, not a free
+     running shimmer; it is decoration, so reduced motion still drops it */
+  var wob = RM_ON ? 0 : KICK_HEAD * (0.55 + 0.45 * Math.sin(a > 0 ? a * 46 : 0));
+  var ph = (a > 0) ? a * 9 : 0;
+  var sq = KICK_SQ;                       /* contact squash: the heaviest head */
+  var sxq = 1 + sq * 0.45, syq = 1 - sq * 0.70;
   var rr = r * (1 + 0.085 * pulse);
   hitBloom(x, y, rr * 1.15, 'kick', t);
   ctx.save();
-  ctx.beginPath(); ctx.ellipse(x, y, rr * 1.09, rr * 1.02, 0, 0, TAU);
+  ctx.beginPath(); ctx.ellipse(x, y, rr * 1.09 * sxq, rr * 1.02 * syq, 0, 0, TAU);
   ctx.fillStyle = 'rgba(10,15,30,0.95)'; ctx.fill();
   ctx.strokeStyle = 'rgba(150,200,255,' + (0.30 + 0.6 * pulse).toFixed(3) + ')';
   ctx.lineWidth = 2.6; ctx.stroke();
-  fillHead(x, y, rr, wob * 0.6, t * 3.1, '#0d2c46', col, 0.3 + pulse, vel);
-  ctx.beginPath(); ctx.arc(x + rr * 0.40, y + rr * 0.26, rr * 0.19, 0, TAU);
+  fillHead(x, y, rr, wob * 0.6, ph, '#0d2c46', col, 0.3 + pulse, vel, sq);
+  ctx.beginPath(); ctx.ellipse(x + rr * 0.40 * sxq, y + rr * 0.26 * syq, rr * 0.19 * sxq, rr * 0.19 * syq, 0, 0, TAU);
   ctx.fillStyle = 'rgba(2,4,10,0.92)'; ctx.fill();
   ctx.strokeStyle = 'rgba(150,220,255,0.28)'; ctx.lineWidth = 1.4; ctx.stroke();
   flashRing(x, y, rr, 'kick', t);
   var bx = x + r * 0.62, by = y + r * 1.30;
+  /* the beater is the piece that strikes (primary); the board under the foot
+     is secondary - it arrives LAG_FOOT later and travels less */
   var tilt = -0.75 + PEDAL_KICK * 0.78;
   ctx.strokeStyle = 'rgba(126,158,205,0.6)'; ctx.lineWidth = 3;
   ctx.beginPath(); ctx.moveTo(bx, FLOOR); ctx.lineTo(bx, by + r * 0.34); ctx.stroke();
@@ -1103,7 +1563,7 @@ function drawKick(P, t, pulse){
   ctx.restore();
   ctx.save();
   ctx.translate(x + r * 0.62, FLOOR + 6);
-  ctx.rotate(-0.34 + PEDAL_KICK * 0.32);
+  ctx.rotate(-0.34 + PEDAL_FOOT * 0.32);
   ctx.fillStyle = 'rgba(180,208,245,0.8)';
   ctx.beginPath(); roundRect(-r * 0.44, -3, r * 0.9, 6, 2); ctx.fill();
   ctx.strokeStyle = 'rgba(90,130,180,0.7)'; ctx.lineWidth = 1; ctx.stroke();
@@ -1113,13 +1573,20 @@ function drawKick(P, t, pulse){
 function drawSnare(P, t, pulse){
   var r = P.r * (1 + 0.085 * pulse), x = P.x, y = P.y;
   hitBloom(x, y, r, 'snare', t);
-  var a = hitAgeV('snare');
-  var vel = (a >= 0 && a < 0.26) ? lastHitVel('snare') * (1 - a / 0.26) : 0;
+  var a = hitAgeV('snare', t);
+  var vel = (a >= 0 && a < 0.26) ? lastHitVel('snare', t) * (1 - a / 0.26) : 0;
   var col = INST_COL[INST_IX['snare']];
-  var wob = SNARE_HEAD * Math.exp(-SNARE_HEAD * 4) * (0.35 + 0.65 * Math.sin(t * 62));
+  var wob = RM_ON ? 0 : SNARE_HEAD * (0.40 + 0.60 * Math.sin(a > 0 ? a * 62 : 0));
+  var ph = (a > 0) ? a * 11 : 0;
+  var sq = SNARE_SQ;
   ctx.save();
+  /* the shell is rigid, the head is not: the shell takes a quarter of the
+     deformation (secondary action), the head all of it */
+  ctx.save();
+  ctx.translate(x, y); ctx.scale(1 + sq * 0.22, 1 - sq * 0.32); ctx.translate(-x, -y);
   shellBody(x, y + r * 0.10, r, r * 0.46, '#3a1030', 'rgba(255,150,225,0.4)');
-  fillHead(x, y, r, wob, t * 3.6, '#37102e', col, 0.25 + pulse, vel);
+  ctx.restore();
+  fillHead(x, y, r, wob, ph, '#37102e', col, 0.25 + pulse, vel, sq);
   ctx.strokeStyle = 'rgba(255,190,230,0.45)'; ctx.lineWidth = 1.4;
   for (var i = 0; i < 8; i++){
     var ang = i / 8 * TAU + 0.2;
@@ -1128,7 +1595,7 @@ function drawSnare(P, t, pulse){
     ctx.stroke();
   }
   flashRing(x, y, r, 'snare', t);
-  var rattle = SNARE_HEAD * (0.5 + 0.5 * Math.sin(t * 90));
+  var rattle = RM_ON ? 0 : SNARE_HEAD * (0.5 + 0.5 * Math.sin(a > 0 ? a * 90 : 0));
   ctx.strokeStyle = 'rgba(255,220,255,' + (0.14 + 0.45 * rattle).toFixed(3) + ')';
   ctx.lineWidth = 1.2;
   for (var k = -2; k <= 2; k++){
@@ -1137,40 +1604,49 @@ function drawSnare(P, t, pulse){
     ctx.lineTo(x + r * 0.6, y + r * (0.79 + k * 0.06));
     ctx.stroke();
   }
-  var sa = (a >= 0) ? (a < 0.05 ? lerp(-1.0, -0.30, a / 0.05) : lerp(-0.30, -1.2, clamp01((a - 0.05) / 0.22))) : -0.30;
-  stick(x - r * 1.02, y - r * 0.72, sa, r * 1.5, 4, 'rgba(220,238,255,0.9)');
-  var sb = (a >= 0) ? (a < 0.05 ? lerp(-1.2, -0.5, a / 0.05) : lerp(-0.5, -1.25, clamp01((a - 0.05) / 0.24))) : -0.34;
-  stick(x + r * 0.98, y - r * 0.85, Math.PI - sb, r * 1.3, 3.6, 'rgba(206,226,250,0.75)');
+  /* sticks: wind-up before the strike, ease-out down, rebound + overshoot */
+  var sw = stickSwingAt('snare', t);
+  stick(x - r * 1.02, y - r * 0.72, lerp(-1.20, -0.30, sw), r * 1.5, 4, 'rgba(220,238,255,0.9)');
+  stick(x + r * 0.98, y - r * 0.85, Math.PI - lerp(-1.25, -0.50, sw), r * 1.3, 3.6, 'rgba(206,226,250,0.75)');
   ctx.restore();
 }
 function drawTom(P, name, t, idx, pulse, mountTo){
   var r = P.r * (1 + 0.09 * pulse), x = P.x, y = P.y;
   hitBloom(x, y, r, name, t);
-  var a = hitAgeV(name);
-  var vel = (a >= 0 && a < 0.24) ? lastHitVel(name) * (1 - a / 0.24) : 0;
+  var a = hitAgeV(name, t);
+  var vel = (a >= 0 && a < 0.24) ? lastHitVel(name, t) * (1 - a / 0.24) : 0;
   var col = INST_COL[INST_IX[name]];
-  var wob = TOM_W[idx] * Math.exp(-TOM_W[idx] * 4) * (0.35 + 0.65 * Math.sin(t * 52 + idx));
+  var wob = RM_ON ? 0 : TOM_W[idx] * (0.40 + 0.60 * Math.sin(a > 0 ? a * 52 : 0));
+  var ph = (a > 0) ? (a * 8 + idx) : idx;
+  var sq = TOM_SQ[idx];
+  var hw = hardwareAt(name, t, 2.4);          /* the mount answers late, small */
   ctx.save();
   if (mountTo){
     ctx.strokeStyle = 'rgba(126,158,205,0.5)'; ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.moveTo(x, y + r * 1.4); ctx.lineTo(x, mountTo.y - mountTo.r * 0.2); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(mountTo.x, mountTo.y - mountTo.r * 0.5); ctx.lineTo(x, y + r * 0.5); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x + hw, y + r * 1.4); ctx.lineTo(x + hw, mountTo.y - mountTo.r * 0.2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(mountTo.x, mountTo.y - mountTo.r * 0.5); ctx.lineTo(x + hw * 0.4, y + r * 0.5); ctx.stroke();
   }
+  ctx.save();
+  ctx.translate(x, y); ctx.scale(1 + sq * 0.22, 1 - sq * 0.32); ctx.translate(-x, -y);
   shellBody(x, y + r * 0.10, r, r * 0.44, '#123048', 'rgba(140,220,255,0.35)');
-  fillHead(x, y, r, wob, t * 3.3 + idx, '#123048', col, 0.2 + pulse, vel);
+  ctx.restore();
+  fillHead(x, y, r, wob, ph, '#123048', col, 0.2 + pulse, vel, sq);
   flashRing(x, y, r, name, t);
-  var sa = (a >= 0) ? (a < 0.05 ? lerp(-1.05, -0.38, a / 0.05) : lerp(-0.38, -1.3, clamp01((a - 0.05) / 0.2))) : -0.32;
-  stick(x + r * 0.92, y - r * 0.72, sa, r * 1.3, 3.4, 'rgba(220,238,255,0.85)');
+  var sw = stickSwingAt(name, t);
+  stick(x + r * 0.92, y - r * 0.72, lerp(-1.30, -0.38, sw), r * 1.3, 3.4, 'rgba(220,238,255,0.85)');
   ctx.restore();
 }
 function drawHiHat(P, t, pulse){
   var r = P.r, x = P.x, y = P.y;
   var col = INST_COL[INST_IX['hihat']];
-  var a1 = hitAgeV('hihat'), a2 = hitAgeV('openhat');
-  var vel = Math.max(a1 >= 0 && a1 < 0.22 ? lastHitVel('hihat') * (1 - a1 / 0.22) : 0,
-                     a2 >= 0 && a2 < 0.30 ? lastHitVel('openhat') * (1 - a2 / 0.30) : 0);
+  var a1 = hitAgeV('hihat', t), a2 = hitAgeV('openhat', t);
+  var vel = Math.max(a1 >= 0 && a1 < 0.22 ? lastHitVel('hihat', t) * (1 - a1 / 0.22) : 0,
+                     a2 >= 0 && a2 < 0.30 ? lastHitVel('openhat', t) * (1 - a2 / 0.30) : 0);
   var lift = HAT_OPEN * 0.30 + HAT_RISE * 0.10;
-  var wob = Math.sin(t * 40) * 0.035 * vel;
+  var ah = (a1 >= 0) ? a1 : ((a2 >= 0) ? a2 : 0);
+  /* METAL: the top disc rocks instead of stretching, locked to the strike, and
+     with the smallest amplitude in the kit - it is the lightest piece */
+  var wob = RM_ON ? 0 : Math.sin(ah * 44) * (membOf('hihat').tilt * 0.55 * vel);
   var sc = 1 + 0.10 * pulse;
   hitBloom(x, y - lift * r * 0.5, r * 1.1, (a2 >= 0 && (a1 < 0 || a2 < a1)) ? 'openhat' : 'hihat', t);
   ctx.save();
@@ -1201,10 +1677,10 @@ function drawHiHat(P, t, pulse){
   ctx.fillStyle = lum(col, 1.5); ctx.fill();
   ctx.restore();
   ctx.strokeStyle = 'rgba(200,220,255,0.5)'; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.moveTo(x, y - r * 1.3 - lift * r); ctx.lineTo(x, y + r * 0.2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x, y - r * 1.3 - HAT_ROD * r); ctx.lineTo(x, y + r * 0.2); ctx.stroke();
   ctx.save();
   ctx.translate(x + r * 0.05, FLOOR + r * 0.34);
-  ctx.rotate(-0.42 + PEDAL_HAT * 0.42);
+  ctx.rotate(-0.42 + PEDAL_HAT_FOOT * 0.42);
   ctx.fillStyle = 'rgba(180,208,245,0.8)';
   ctx.beginPath(); roundRect(-r * 0.45, -3, r * 1.05, 6, 2); ctx.fill();
   ctx.strokeStyle = 'rgba(90,130,180,0.65)'; ctx.lineWidth = 1; ctx.stroke();
@@ -1212,19 +1688,20 @@ function drawHiHat(P, t, pulse){
   ctx.strokeStyle = 'rgba(150,180,225,0.4)'; ctx.lineWidth = 1.6;
   ctx.beginPath(); ctx.moveTo(x - r * 0.4, FLOOR + r * 0.36); ctx.lineTo(x - r * 0.15, y + r * 0.35); ctx.stroke();
   flashRing(x, y - lift * r * 0.7, r * 1.05, (a2 >= 0 && (a1 < 0 || a2 < a1)) ? 'openhat' : 'hihat', t);
-  var a = (a1 >= 0 && (a2 < 0 || a1 <= a2)) ? a1 : -1;
-  var sa = (a >= 0) ? (a < 0.05 ? lerp(-1.35, -0.5, a / 0.05) : lerp(-0.5, -1.5, clamp01((a - 0.05) / 0.22))) : -0.30;
-  stick(x + r * 1.10, y - r * 1.15 - lift * r, sa, r * 1.6, 3.6, 'rgba(220,238,255,0.85)');
+  var sw = stickSwingAt((a2 >= 0 && (a1 < 0 || a2 < a1)) ? 'openhat' : 'hihat', t);
+  stick(x + r * 1.10, y - r * 1.15 - lift * r, lerp(-1.50, -0.50, sw), r * 1.6, 3.6, 'rgba(220,238,255,0.85)');
   ctx.restore();
 }
 function drawCymbal(P, name, t, tilt, isCrash, pulse){
   var r = P.r, x = P.x, y = P.y;
   var col = INST_COL[INST_IX[name]];
-  var a = hitAgeV(name);
-  var vel = (a >= 0 && a < 0.4) ? lastHitVel(name) * (1 - a / 0.4) : 0;
+  var a = hitAgeV(name, t);
+  var vel = (a >= 0 && a < 0.4) ? lastHitVel(name, t) * (1 - a / 0.4) : 0;
   var w = (isCrash ? CRASH_W : RIDE_W);
-  var wob = (a >= 0) ? Math.sin(t * (isCrash ? 21 : 17)) * (0.13 * w) * Math.exp(-a * 3.0) : 0;
-  var rr = r * (1 + 0.07 * pulse);
+  /* METAL: a cymbal does not squash. The hit goes into a tilt that rocks around
+     the bell and dies away, locked to the strike rather than to wall time. */
+  var wob = (!RM_ON && a >= 0) ? Math.sin(a * (isCrash ? 24 : 20)) * (membOf(name).tilt * w) * Math.exp(-a * 3.4) : 0;
+  var rr = r;
   hitBloom(x, y, rr * 0.85, name, t);
   ctx.save();
   ctx.translate(x, y);
@@ -1244,7 +1721,7 @@ function drawCymbal(P, name, t, tilt, isCrash, pulse){
   for (var i = 1; i <= 3; i++){
     ctx.beginPath(); ctx.ellipse(0, 0, rr * (1 - i * 0.2), rr * 0.24 * (1 - i * 0.2), 0, 0, TAU); ctx.stroke();
   }
-  if (pulse > 0.03){
+  if (!RM_ON && pulse > 0.03){          /* rotating shimmer spokes: decorative */
     ctx.save();
     ctx.globalAlpha = 0.55 * pulse;
     ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
@@ -1260,10 +1737,10 @@ function drawCymbal(P, name, t, tilt, isCrash, pulse){
   ctx.beginPath(); ctx.ellipse(0, 0, rr * 0.16, rr * 0.05, 0, 0, TAU);
   ctx.fillStyle = lum(col, 1.6); ctx.fill();
   flashRing(0, 0, rr * 0.9, name, t);
-  var sa = (a >= 0) ? (a < 0.045 ? lerp(-1.2, -0.5, a / 0.045) : lerp(-0.5, -1.4, clamp01((a - 0.045) / 0.24))) : -0.34;
+  var sw = stickSwingAt(name, t);
   ctx.save();
   ctx.rotate(-0.2);
-  stick(rr * 0.42, -rr * 0.34, sa, rr * 1.05, 3.4, 'rgba(220,238,255,0.8)');
+  stick(rr * 0.42, -rr * 0.34, lerp(-1.40, -0.50, sw), rr * 1.05, 3.4, 'rgba(220,238,255,0.8)');
   ctx.restore();
   ctx.restore();
   if (isCrash && pulse > 0.02){
@@ -1292,10 +1769,30 @@ function rollRowY(m){
   else frac = (WHITE_KEYS[ix].x + 0.5) / Math.max(1, K.nWhite);
   return lane.y + lane.h - frac * lane.h;
 }
-function rollX(t){ return lane.x + 2 + (t - V.time) * PXPS; }
+/* x of an event at evT when the playhead sits at nowT. The time is passed in
+   explicitly instead of being read from the global clock, so the roll is a pure
+   function of the frame's t. */
+function rollX(evT, nowT){ return lane.x + 2 + (evT - nowT) * PXPS; }
+/* reduced motion: hold the roll window and advance it in DISCRETE steps at bar
+   boundaries. The continuous scroll is the largest area of optic flow on the
+   canvas (the whole 707x583 note field at 141.4 px/s - with zero notes visible
+   the bar grid alone still moves at that rate), and large-area optic flow is
+   the specific thing a vestibular-sensitive user needs removed. The notes, the
+   bar grid and the section labels must stay legible, so the window is static
+   between steps and jumps one bar at a time; position is carried by the bar /
+   beat / timecode readouts, the chips and the sounding keys. Pure function of
+   t: the same song time always draws the same window, so purity and frame-rate
+   independence are untouched. */
+function rollViewTime(t){
+  if (!RM_ON) return t;
+  var bar = SPB * 4;
+  if (!(bar > 0.05)) return t;
+  return FIRST_BEAT + Math.floor((t - FIRST_BEAT) / bar) * bar;
+}
 function paintRoll(t){
   var x0 = lane.x, y0 = lane.y, w = lane.w, h = lane.h, i, kk;
   var rowH = rollRowH();
+  var vt = rollViewTime(t);          /* window time: t, or a bar-stepped view */
   ctx.save();
   ctx.beginPath(); ctx.rect(x0, y0, w, h); ctx.clip();
   ctx.fillStyle = 'rgba(3,5,14,0.5)'; ctx.fillRect(x0, y0, w, h);
@@ -1318,12 +1815,12 @@ function paintRoll(t){
     ctx.fillText('C' + (Math.floor(WHITE_KEYS[i].midi / 12) - 1), x0 + 3, Math.min(y0 + h - 3, cy + 3.4));
   }
   /* --- time grid: beats, bars with numbers --- */
-  var b0 = Math.floor((t - 0.5 - FIRST_BEAT) / SPB);
+  var b0 = Math.floor((vt - 0.5 - FIRST_BEAT) / SPB);
   ctx.beginPath();
   ctx.strokeStyle = 'rgba(120,190,255,0.10)';
   for (var b = b0; b < b0 + Math.ceil(VIS_WINDOW / SPB) + 3; b++){
     var bt = FIRST_BEAT + b * SPB;
-    var gx = rollX(bt);
+    var gx = rollX(bt, vt);
     if (gx < x0 || gx > x0 + w) continue;
     if (b % 4 === 0) continue;
     ctx.moveTo(Math.round(gx) + 0.5, y0); ctx.lineTo(Math.round(gx) + 0.5, y0 + h);
@@ -1334,7 +1831,7 @@ function paintRoll(t){
   for (var b2 = b0; b2 < b0 + Math.ceil(VIS_WINDOW / SPB) + 3; b2++){
     if (b2 % 4 !== 0) continue;
     var bt2 = FIRST_BEAT + b2 * SPB;
-    var gx2 = rollX(bt2);
+    var gx2 = rollX(bt2, vt);
     if (gx2 < x0 || gx2 > x0 + w) continue;
     ctx.moveTo(Math.round(gx2) + 0.5, y0); ctx.lineTo(Math.round(gx2) + 0.5, y0 + h);
   }
@@ -1343,15 +1840,15 @@ function paintRoll(t){
   ctx.font = '600 9px ui-monospace,Menlo,Consolas,monospace';
   for (var b3 = b0; b3 < b0 + Math.ceil(VIS_WINDOW / SPB) + 3; b3++){
     if (b3 % 4 !== 0) continue;
-    var gx3 = rollX(FIRST_BEAT + b3 * SPB);
+    var gx3 = rollX(FIRST_BEAT + b3 * SPB, vt);
     if (gx3 < x0 + 14 || gx3 > x0 + w - 6) continue;
     ctx.fillText(String(Math.floor(b3 / 4) + 1), gx3 + 3, y0 + 11);
   }
   /* --- section boundaries --- */
   for (i = 0; i < SEC.length; i++){
     var st0 = SEC[i].t, st1 = (i + 1 < SEC.length) ? SEC[i + 1].t : DURATION;
-    if (st1 < t - 0.5 || st0 > t + VIS_WINDOW) continue;
-    var sx = rollX(st0);
+    if (st1 < vt - 0.5 || st0 > vt + VIS_WINDOW) continue;
+    var sx = rollX(st0, vt);
     ctx.strokeStyle = 'rgba(255,62,200,0.45)'; ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.moveTo(sx, y0); ctx.lineTo(sx, y0 + h); ctx.stroke();
     if (sx >= x0 - 40 && sx <= x0 + w){
@@ -1366,16 +1863,20 @@ function paintRoll(t){
     }
   }
   /* --- notes --- */
-  queryRoll(t - 0.30, t + VIS_WINDOW);
+  /* the window is [vt, vt + VIS_WINDOW]; queryRoll selects by OVERLAP so a
+     sustained note whose onset is already behind the window still draws its
+     tail (see queryRoll). */
+  queryRoll(vt, vt + VIS_WINDOW);
   rollIndexed = rollCount;
   var drawn = 0, right = x0 + w;
   for (i = rollStart; i < rollStart + rollCount; i++){
     var m = pMidi[i];
+    if (pEnd[i] < vt) continue;        /* exact overlap test: ended before the window opens */
     if (m < KEY_LO || m > KEY_HI) continue;
-    var nx = rollX(pT[i]);
+    var nx = rollX(pT[i], vt);
     var nw = (pEnd[i] - pT[i]) * PXPS;
     if (nw < 3) nw = 3;
-    var nx2 = rollX(pEnd[i]);
+    var nx2 = rollX(pEnd[i], vt);
     if (nx2 > right) nx2 = right;
     if (nx > right) continue;
     nw = nx2 - nx;
@@ -1383,6 +1884,8 @@ function paintRoll(t){
     var ny = rollRowY(m);
     var nh = Math.max(3.5, rowH * 0.78);
     var col = PC_RGB[pClass[i]];
+    /* the highlight is driven by the REAL time: a note that is sounding is lit
+       even while it sits inside the stepped (held) window */
     var playing = (pT[i] <= t && pEnd[i] > t);
     ctx.fillStyle = withA(col, playing ? (0.72 + 0.28 * pVel[i]) : (0.42 + 0.5 * pVel[i]));
     ctx.fillRect(nx, ny - nh / 2, nw, nh);
@@ -1395,26 +1898,40 @@ function paintRoll(t){
     drawn++;
   }
   rollDrawn = drawn;
-  /* --- NOW line (the playhead) --- */
+  /* --- NOW line (the playhead) ---
+     The window can be HELD at a bar start (reduced motion) while now keeps
+     moving inside it, so the playhead is drawn at the REAL now, not at the
+     window's left edge. The lit notes have always used the real t, so a lit
+     note used to sit up to a whole bar (292 px) to the right of a line that
+     claimed to be now. Window stepping and the now-marker are separate
+     concerns: only the window steps. In normal mode vt === t, so this is the
+     same x0 + 1 the line has always been drawn at. */
+  var nowX = rollX(t, vt) - 1;
+  if (nowX < x0 + 1) nowX = x0 + 1;
+  if (nowX > x0 + w - 1) nowX = x0 + w - 1;
   ctx.strokeStyle = 'rgba(66,245,255,0.85)'; ctx.lineWidth = 2;
   ctx.shadowColor = 'rgba(66,245,255,0.9)'; ctx.shadowBlur = 14;
-  ctx.beginPath(); ctx.moveTo(x0 + 1, y0); ctx.lineTo(x0 + 1, y0 + h); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(nowX, y0); ctx.lineTo(nowX, y0 + h); ctx.stroke();
   ctx.shadowBlur = 0;
   ctx.restore();
-  /* footer chrome (outside the clip): the NOW marker for the pinned playhead */
+  /* footer chrome (outside the clip): the NOW marker travels with the playhead */
   ctx.save();
   ctx.font = '700 9px ui-monospace,Menlo,Consolas,monospace';
   ctx.textAlign = 'left';
   ctx.fillStyle = 'rgba(66,245,255,0.9)';
-  ctx.fillText('NOW', lane.x, lane.y + lane.h + 12);
+  ctx.fillText('NOW', Math.min(nowX, x0 + w - 26), lane.y + lane.h + 12);
   ctx.strokeStyle = 'rgba(66,245,255,0.5)'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(lane.x, lane.y + lane.h + 2); ctx.lineTo(lane.x + 26, lane.y + lane.h + 2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(nowX, lane.y + lane.h + 2); ctx.lineTo(nowX + 26, lane.y + lane.h + 2); ctx.stroke();
   ctx.restore();
 }
 
 /* ---- 10. paint: keyboard ------------------------------------------------- */
 function paintKeyboard(t){
   var x0 = kb.x, y0 = kb.y, w = kb.w, h = kb.h;
+  /* reduced motion: the key still lights and still travels - it is a discrete,
+     informative pose, not decoration - but at half the distance, because the
+     travel is the part that is continuous field motion. */
+  var ktravel = RM_ON ? 0.5 : 1;
   ctx.save();
   ctx.fillStyle = '#05070f'; ctx.fillRect(x0, y0 - 3, w, h + 3);
   ctx.strokeStyle = 'rgba(120,190,255,0.25)'; ctx.lineWidth = 1;
@@ -1422,34 +1939,39 @@ function paintKeyboard(t){
   var fg = ctx.createLinearGradient(0, y0, 0, y0 + 5);
   fg.addColorStop(0, 'rgba(255,62,200,0.55)'); fg.addColorStop(1, 'rgba(255,62,200,0.05)');
   ctx.fillStyle = fg; ctx.fillRect(x0, y0, w, 5);
-  var wh = h - 4, i, kk, m, kx, kw, amp, on, top, g;
+  var wh = h - 4, i, kk, m, kx, kw, amp, on, top, g, depth, lit;
   for (i = 0; i < WHITE_KEYS.length; i++){
     kk = WHITE_KEYS[i]; m = kk.midi;
     kx = x0 + kk.x * K.ww; kw = K.ww;
     on = KEY_ON[m]; amp = on ? KEY_AMP[m] : 0;
-    top = y0 + 5 + amp * (wh - 5) * 0.42;
-    g = on ? ctx.createLinearGradient(0, top, 0, top + (wh - (top - y0 - 5))) : gWhite[i];
+    /* key travel comes from computeActive: ease-out down, slower eased release,
+       scaled a little by velocity (a hard note bottoms out, a soft one does
+       not). The old key snapped between up and down on the note boundary. */
+    depth = KEY_DEPTH[m] * (0.62 + 0.38 * amp);
+    lit = depth > 0.03;
+    top = y0 + 5 + depth * ktravel * (wh - 5) * 0.42;
+    g = lit ? ctx.createLinearGradient(0, top, 0, top + (wh - (top - y0 - 5))) : gWhite[i];
     if (!g){
       g = ctx.createLinearGradient(0, y0 + 5, 0, y0 + wh);
       if ((m % 12) === 0){ g.addColorStop(0, '#ffffff'); g.addColorStop(0.6, '#e6f2ff'); g.addColorStop(1, '#bcd2ea'); }
       else { g.addColorStop(0, '#fdfeff'); g.addColorStop(0.6, '#eef4fc'); g.addColorStop(1, '#c9d8ec'); }
       gWhite[i] = g;
     }
-    if (on){
-      g.addColorStop(0, 'rgba(150,240,255,' + (0.55 + 0.4 * amp).toFixed(3) + ')');
+    if (lit){
+      g.addColorStop(0, 'rgba(150,240,255,' + (0.30 + 0.65 * depth).toFixed(3) + ')');
       g.addColorStop(0.18, 'rgba(70,170,235,0.85)');
       g.addColorStop(1, 'rgba(20,60,120,0.95)');
     }
     ctx.fillStyle = g;
     ctx.fillRect(Math.floor(kx) + 0.5, top, Math.ceil(kw) - 1, wh - (top - y0 - 5) - 2);
-    ctx.strokeStyle = on ? 'rgba(180,250,255,0.9)' : 'rgba(10,14,26,0.85)';
+    ctx.strokeStyle = lit ? 'rgba(180,250,255,0.9)' : 'rgba(10,14,26,0.85)';
     ctx.lineWidth = 1;
     ctx.strokeRect(Math.floor(kx) + 0.5, top + 0.5, Math.ceil(kw) - 1, wh - (top - y0 - 5) - 3);
-    if (on){
+    if (lit){
       ctx.save();
-      ctx.globalAlpha = 0.35 + 0.5 * amp;
+      ctx.globalAlpha = 0.22 + 0.6 * depth;
       ctx.fillStyle = 'rgba(66,245,255,0.9)';
-      ctx.shadowColor = 'rgba(66,245,255,0.95)'; ctx.shadowBlur = 18 * (0.4 + amp);
+      ctx.shadowColor = 'rgba(66,245,255,0.95)'; ctx.shadowBlur = 18 * (0.30 + depth);
       ctx.fillRect(Math.floor(kx) + 2, top + (wh - (top - y0 - 5)) - 4, Math.max(2, Math.ceil(kw) - 5), 3);
       ctx.restore();
     }
@@ -1457,7 +1979,7 @@ function paintKeyboard(t){
       ctx.save();
       ctx.font = '600 ' + Math.max(8, Math.min(12, K.ww * 0.42)).toFixed(0) + 'px ui-monospace,Menlo,Consolas,monospace';
       ctx.textAlign = 'center';
-      ctx.fillStyle = on ? 'rgba(255,255,255,0.95)' : 'rgba(60,80,110,0.85)';
+      ctx.fillStyle = lit ? 'rgba(255,255,255,0.95)' : 'rgba(60,80,110,0.85)';
       ctx.fillText('C' + (Math.floor(m / 12) - 1), kx + kw / 2, y0 + wh - 8);
       ctx.restore();
     }
@@ -1467,14 +1989,16 @@ function paintKeyboard(t){
     kx = x0 + (kk.wx + 1) * K.ww - K.bw / 2;
     on = KEY_ON[m]; amp = on ? KEY_AMP[m] : 0;
     var bhh = (h - 5) * 0.62;
-    var btop = y0 + 5 + amp * bhh * 0.34;
-    var bg = on ? ctx.createLinearGradient(0, btop, 0, btop + bhh) : gBlack[i];
+    var bdepth = KEY_DEPTH[m] * (0.62 + 0.38 * amp);
+    var blit = bdepth > 0.03;
+    var btop = y0 + 5 + bdepth * ktravel * bhh * 0.34;
+    var bg = blit ? ctx.createLinearGradient(0, btop, 0, btop + bhh) : gBlack[i];
     if (!bg){
       bg = ctx.createLinearGradient(0, y0 + 5, 0, y0 + 5 + bhh);
       bg.addColorStop(0, '#2a3244'); bg.addColorStop(0.35, '#151b28'); bg.addColorStop(1, '#080b13');
       gBlack[i] = bg;
     }
-    if (on){
+    if (blit){
       bg.addColorStop(0, 'rgba(255,120,225,0.95)');
       bg.addColorStop(0.5, 'rgba(150,40,140,0.95)');
       bg.addColorStop(1, 'rgba(60,10,60,0.98)');
@@ -1483,11 +2007,11 @@ function paintKeyboard(t){
     ctx.beginPath();
     roundRect(Math.floor(kx) + 0.5, btop, Math.ceil(K.bw) - 1, bhh, Math.min(3, K.bw * 0.18));
     ctx.fill();
-    ctx.strokeStyle = on ? 'rgba(255,180,240,0.95)' : 'rgba(140,170,215,0.28)';
+    ctx.strokeStyle = blit ? 'rgba(255,180,240,0.95)' : 'rgba(140,170,215,0.28)';
     ctx.lineWidth = 1; ctx.stroke();
-    if (on){
+    if (blit){
       ctx.save();
-      ctx.globalAlpha = 0.5 + 0.5 * amp;
+      ctx.globalAlpha = 0.32 + 0.62 * bdepth;
       ctx.fillStyle = 'rgba(255,62,200,0.9)';
       ctx.shadowColor = 'rgba(255,62,200,0.95)'; ctx.shadowBlur = 16;
       ctx.fillRect(Math.floor(kx) + 2, btop + bhh - 3, Math.max(2, Math.ceil(K.bw) - 5), 2.5);
@@ -1511,11 +2035,14 @@ function paintHud(t){
   ctx.fillText('BAR ' + bar + '  BEAT ' + (beat + 1).toFixed(1), paneRoll.x + paneRoll.w - 10, lane.y + lane.h + 12);
   ctx.restore();
 }
-function pushHud(){
-  if (Math.abs(V.time - lastHudT) < 0.06) return;
-  lastHudT = V.time;
-  elTcode.textContent = fmtTime(V.time) + ' / ' + fmtTime(DURATION);
-  var p = clamp01(V.time / DURATION) * 100;
+/* The DOM readout is throttled on the SONG TIME itself (not on a frame counter),
+   so it is a pure function of t; force bypasses the throttle for the render
+   hook, where the readouts must match the frame that was just drawn. */
+function pushHud(t, force){
+  if (!force && Math.abs(t - lastHudT) < 0.06) return;
+  lastHudT = t;
+  elTcode.textContent = fmtTime(t) + ' / ' + fmtTime(DURATION);
+  var p = clamp01(t / DURATION) * 100;
   elSeekFill.style.width = p.toFixed(2) + '%';
   elKnob.style.left = p.toFixed(2) + '%';
   if (SEC_IX >= 0 && SEC_IX < SEC.length) elSection.textContent = SEC[SEC_IX].name || '--';
@@ -1724,13 +2251,44 @@ window.addEventListener('pointerdown', enableSound, true);
 window.addEventListener('keydown', enableSound, true);
 
 /* ---- 14. main loop ------------------------------------------------------ */
+/* drawScene(t) paints ONE complete frame for song time t and is a pure function
+   of t (plus the loaded data and the layout): every hit-driven value is read
+   back out of the event tables, nothing is integrated across frames and the
+   transport is never touched. That is what lets a seek land on exactly the
+   right picture, what makes the frame reproducible for video export, and what
+   makes the render frame-rate independent. */
+function drawScene(t){
+  computeActive(t);
+  computeDrums(t);
+  SEC_IX = sectionAt(t);
+  CHORD_IX = chordAt(t);
+  /* CHORD_NAME must be CLEARED, not just refreshed on a hit: it is a "last
+     value" and the old form left the previous chord on screen (and in
+     state.chord) for every t where chordAt(t) returns -1 - so a fresh load
+     rendered one frame at t=0.02 and a load that had played past t=200
+     rendered a different one, and STOP (setPlaying(false); seekTo(0)) left the
+     canvas reading "CHORD EM" at t=0 where the first chord is D at 0.038 s. */
+  CHORD_NAME = (CHORD_IX >= 0 && CHORD_IX < CH.length && CH[CHORD_IX].name) ? CH[CHORD_IX].name : '';
+  paintBackdrop(t);
+  paintKit(t);
+  paintRoll(t);
+  paintKeyboard(t);
+  paintHud(t);
+  pushHud(t, false);
+}
 var lastNow = 0, fpsAcc = 0, fpsFrames = 0, fpsLast = 0, FPS = 0, frameNo = 0, msFrame = 0;
 function frame(){
   requestAnimationFrame(frame);
   var t0 = perfNow();
   try {
     var now = t0;
-    var dt = lastNow ? Math.min(0.1, now - lastNow) : 0.016;
+    /* The FPS delta is NOT clamped. Math.min(0.1, now - lastNow) capped each
+       frame's contribution at 0.1 s, so fpsFrames/fpsAcc could never report
+       below 10: the readout said "10" at a true 2.17 fps and at a true 1.17 fps,
+       which made low-frame-rate evidence unfalsifiable. The rate uses the true
+       delta; a stale delta after a hidden tab is dropped in the
+       visibilitychange handler, not by lying about the frame rate. */
+    var rawDt = lastNow ? (now - lastNow) : 0.016;
     lastNow = now;
     frameNo++;
     syncTransport();
@@ -1739,19 +2297,9 @@ function frame(){
       V.time = Math.min(DURATION, SCORE_END);
       setPlaying(false);
     }
-    computeActive();
-    computeDrums();
-    SEC_IX = sectionAt(V.time);
-    CHORD_IX = chordAt(V.time);
-    if (CHORD_IX >= 0 && CHORD_IX < CH.length && CH[CHORD_IX].name) CHORD_NAME = CH[CHORD_IX].name;
     synthSchedule();
-    paintBackdrop(V.time);
-    paintKit(V.time);
-    paintRoll(V.time);
-    paintKeyboard(V.time);
-    paintHud(V.time);
-    pushHud();
-    fpsAcc += dt; fpsFrames++;
+    drawScene(V.time);
+    fpsAcc += rawDt; fpsFrames++;
     if (now - fpsLast > 0.5){
       FPS = fpsFrames / Math.max(0.001, fpsAcc);
       elFps.textContent = FPS.toFixed(0);
@@ -1773,10 +2321,40 @@ function frame(){
 window.__ULTRA_FRAME__ = function(){ return frameNo; };
 window.__ULTRA_SEEK__ = function(t){ seekTo(+t || 0); return V.time; };
 window.__ULTRA_PLAY__ = function(on){ setPlaying(on !== false); return V.playing; };
+
+/* ---- deterministic render hook (video export / purity tests) -------------
+   __ULTRA_RENDER_AT__(t) seeks the state to t, draws exactly one frame
+   synchronously and returns a hash of the canvas. Because drawScene is a pure
+   function of t, rendering the same t twice - in any order, at any frame rate,
+   after any amount of real time - returns the same frameHash. */
+function hashMul(x){
+  if (Math.imul) return Math.imul(x, 16777619);
+  return ((x << 24) + (x << 1) + x) | 0;   /* 16777619 == 2^24 + 3, exact in ES5 */
+}
+function canvasHash(){
+  /* strided FNV-1a over the raw canvas pixels: every 97th pixel, RGB only */
+  var d = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  var n = d.length, step = 4 * 97, i, hv = 2166136261;
+  for (i = 0; i + 2 < n; i += step){
+    hv = hashMul(hv ^ d[i]);
+    hv = hashMul(hv ^ d[i + 1]);
+    hv = hashMul(hv ^ d[i + 2]);
+  }
+  return hv >>> 0;
+}
+window.__ULTRA_RENDER_AT__ = function(t){
+  var tt = clamp(+t || 0, 0, Math.min(DURATION, SCORE_END + 0.5));
+  seekTo(tt);                        /* state and transport now sit at tt */
+  V.time = tt;
+  drawScene(tt);                     /* exactly one frame, synchronously */
+  pushHud(tt, true);
+  return { t: tt, frameHash: canvasHash(), activeKeys: ACTIVE.length,
+           drumsActive: drumsActiveAt(tt), rollNotesVisible: rollDrawn };
+};
 window.__ULTRA_STATE__ = function(){
   return {
     ready: window.__ULTRA_READY__, errs: window.__ULTRA_ERR.length, frame: frameNo,
-    fps: Math.round(FPS), msPerFrame: +msFrame.toFixed(2), time: +V.time.toFixed(3), dur: +DURATION.toFixed(3),
+    fps: Math.round(FPS), fpsTrue: +FPS.toFixed(2), msPerFrame: +msFrame.toFixed(2), time: +V.time.toFixed(3), dur: +DURATION.toFixed(3),
     playing: V.playing, mode: synthOn ? 'synth' : trBackend(), speed: V.speed,
     notes: NP, drums: ND, sections: SEC.length, chords: CH.length, data: DATA_STATUS,
     audioOK: V.audioOK, audioState: AUDIO.state, audioDur: +AUDIO.dur.toFixed(3),
@@ -1817,14 +2395,17 @@ window.__ULTRA_STATE__ = function(){
       ctx.restore();
       return g;
     })(),
-    rollWindowSec: VIS_WINDOW, rollNotesVisible: rollDrawn, rollNotesIndexed: rollIndexed,
+    rollWindowSec: VIS_WINDOW, rollViewSec: +rollViewTime(V.time).toFixed(3),
+    rollNotesVisible: rollDrawn, rollNotesIndexed: rollIndexed,
     rollWidthPx: Math.round(lane.w), rollHeightPx: Math.round(lane.h),
     playheadPx: Math.round(lane.x), pxPerSec: Math.round(PXPS),
     ctxState: AC ? AC.state : 'none', ctxTime: AC ? +AC.currentTime.toFixed(3) : -1,
     audioStartedAt: +AUDIO.startedAt.toFixed(3), audioArmed: AUDIO.armed, audioRate: AUDIO.rate,
     audioOffsetSec: (AUDIO.armed && AC) ? +((AC.currentTime - AUDIO.startedAt) * AUDIO.rate).toFixed(3) : -1,
     srcActive: !!AUDIO.src, section: (SEC_IX >= 0 && SEC_IX < SEC.length) ? SEC[SEC_IX].name : '',
-    chord: CHORD_NAME
+    chord: CHORD_NAME,
+    reducedMotion: RM_ON, drumsActive: drumsActiveAt(V.time),
+    portrait: !!PORTRAIT
   };
 };
 
