@@ -1909,9 +1909,21 @@ function paintRoll(t){
   var nowX = rollX(t, vt) - 1;
   if (nowX < x0 + 1) nowX = x0 + 1;
   if (nowX > x0 + w - 1) nowX = x0 + w - 1;
-  ctx.strokeStyle = 'rgba(66,245,255,0.85)'; ctx.lineWidth = 2;
-  ctx.shadowColor = 'rgba(66,245,255,0.9)'; ctx.shadowBlur = 14;
-  ctx.beginPath(); ctx.moveTo(nowX, y0); ctx.lineTo(nowX, y0 + h); ctx.stroke();
+  /* The halo and the second pixel of width are decoration: together they make
+     the playhead a soft ~30 px band of the note field lighting up and fading as
+     it crosses, which is exactly the optic flow the reduced tier exists to
+     remove. The crisp column is the INFORMATION ("now is here"), so the tier
+     keeps the marker and drops the halo and the extra pixel - the playhead
+     still travels with the REAL now instead of sitting on the bar start, it
+     just stops dragging a 30 px glow across the roll while it does. Snapping to
+     a half-pixel keeps the 1 px column crisp instead of antialiasing it back
+     over two columns. */
+  var nowD = RM_ON ? (Math.round(nowX) + 0.5) : nowX;
+  ctx.strokeStyle = 'rgba(66,245,255,0.85)'; ctx.lineWidth = RM_ON ? 1 : 2;
+  if (!RM_ON){
+    ctx.shadowColor = 'rgba(66,245,255,0.9)'; ctx.shadowBlur = 14;
+  }
+  ctx.beginPath(); ctx.moveTo(nowD, y0); ctx.lineTo(nowD, y0 + h); ctx.stroke();
   ctx.shadowBlur = 0;
   ctx.restore();
   /* footer chrome (outside the clip): the NOW marker travels with the playhead */
@@ -1919,9 +1931,9 @@ function paintRoll(t){
   ctx.font = '700 9px ui-monospace,Menlo,Consolas,monospace';
   ctx.textAlign = 'left';
   ctx.fillStyle = 'rgba(66,245,255,0.9)';
-  ctx.fillText('NOW', Math.min(nowX, x0 + w - 26), lane.y + lane.h + 12);
+  ctx.fillText('NOW', Math.min(nowD, x0 + w - 26), lane.y + lane.h + 12);
   ctx.strokeStyle = 'rgba(66,245,255,0.5)'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(nowX, lane.y + lane.h + 2); ctx.lineTo(nowX + 26, lane.y + lane.h + 2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(nowD, lane.y + lane.h + 2); ctx.lineTo(nowD + 26, lane.y + lane.h + 2); ctx.stroke();
   ctx.restore();
 }
 
