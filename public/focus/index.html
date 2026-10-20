@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Instrument Focus — hear one player inside a song</title>
+<style>
+  :root{--ink:#14120f;--paper:#f4efe6;--line:#d8cfc0;--accent:#b8532a;--mute:#7a7166}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);
+       font:16px/1.6 "Iowan Old Style",Georgia,"Times New Roman",serif;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:820px;margin:0 auto;padding:64px 28px 96px}
+  .kicker{font:600 11px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.22em;
+          text-transform:uppercase;color:var(--accent)}
+  h1{font-size:clamp(30px,5vw,46px);line-height:1.1;margin:18px 0 10px;font-weight:600;letter-spacing:-.01em}
+  .sub{font-size:19px;color:#4a443c;margin:0 0 34px;max-width:38em}
+  h2{font:600 11px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.2em;text-transform:uppercase;
+     color:var(--mute);margin:52px 0 16px}
+  .card{display:block;border:1px solid var(--line);border-radius:10px;padding:20px 22px;margin:0 0 12px;
+        text-decoration:none;color:inherit;background:#fbf8f2;transition:border-color .15s,transform .15s}
+  .card:hover{border-color:var(--accent);transform:translateY(-1px)}
+  .card b{display:block;font-size:18px;font-weight:600;margin-bottom:3px}
+  .card span{font:13px/1.5 ui-sans-serif,system-ui,sans-serif;color:var(--mute)}
+  .tag{display:inline-block;font:600 10px/1 ui-sans-serif,system-ui,sans-serif;letter-spacing:.12em;
+       text-transform:uppercase;padding:4px 7px;border-radius:4px;background:#ece4d6;color:#6b6154;margin-left:6px}
+  .tag.dead{background:#f0ded7;color:#9d4426}
+  p{margin:0 0 14px}
+  .note{border-left:2px solid var(--line);padding-left:16px;color:#5a5349;font-size:15px}
+  code{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:#ece4d6;padding:2px 5px;border-radius:3px}
+  ol{padding-left:22px}
+  li{margin:0 0 8px}
+  hr{border:0;border-top:1px solid var(--line);margin:48px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="kicker">Instrument Focus</div>
+  <h1>Hear one player inside a song.</h1>
+  <p class="sub">Separate a finished mix into its instruments, then push one forward and pull the rest back.
+     Nothing is re-recorded. You are hearing the original performance, balanced differently.</p>
+
+  <h2>Try it</h2>
+
+  <a class="card" href="song-a.html">
+    <b>八十八鍵の宇宙 — Orangestar</b>
+    <span>4 instruments found of 6<span class="tag">drums</span><span class="tag">piano</span><span class="tag">vocals</span><span class="tag">other</span><span class="tag dead">bass</span><span class="tag dead">guitar</span></span>
+  </a>
+
+  <a class="card" href="song-b.html">
+    <b>アスノヨゾラ哨戒班 — Kaji drum cover</b>
+    <span>5 instruments found of 6<span class="tag">drums</span><span class="tag">bass</span><span class="tag">guitar</span><span class="tag">vocals</span><span class="tag">other</span><span class="tag dead">piano</span></span>
+  </a>
+
+  <p class="note">The channel list is measured from the audio, not assumed. That is why the two songs
+     show different instruments. A song with no guitar simply has no guitar fader.</p>
+
+  <h2>How to use it</h2>
+  <ol>
+    <li>Open a song. Click an instrument name at the bottom, or drag its fader.</li>
+    <li>The chosen instrument gets +9 dB, the others −6 dB, then the whole mix is levelled to −16 LUFS,
+        so you are judging balance rather than volume.</li>
+    <li><code>BALANCED</code> puts everything back flat. <code>M</code> mutes, <code>S</code> solos,
+        keys <code>1</code>–<code>N</code> solo each channel, <code>Space</code> plays.</li>
+  </ol>
+
+  <h2>How it works</h2>
+  <p>Each song is separated into six stems with HTDemucs-6s: drums, bass, vocals, piano, guitar and
+     a catch-all. Each stem is measured, and any stem below −45 dBFS is reported as absent rather than
+     offered as a fader that does nothing. The page then rebuilds the mix live in the browser from
+     those six tracks. Everything is inside one file; there is no server and no network request after
+     the page loads.</p>
+
+  <hr>
+
+  <h2>Honest limits</h2>
+  <p>Separation is a best guess, not a clean take. Soloing one instrument can sound hollow where the
+     model dropped a transient, and there is some bleed between channels. <code>other</code> is a
+     bucket, not an instrument — strings, synths and organ all land there. Six channels is this
+     model's ceiling. The audio is encoded at 96 kbps, which costs about 1 percent of the energy
+     above 8 kHz.</p>
+  <p>Both songs here are copyrighted recordings, embedded for demonstration. The tool itself only
+     rearranges audio the listener already has.</p>
+</div>
+</body>
+</html>
