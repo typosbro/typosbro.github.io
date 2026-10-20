@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azizbek Umidjonov — Spiko case study</title>
+<style>
+  :root {
+    --bg: #fbfbfa;
+    --fg: #16161a;
+    --muted: #5c5c66;
+    --line: #e3e3e0;
+    --accent: #1f4fd8;
+    --card: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101014;
+      --fg: #ececef;
+      --muted: #9a9aa6;
+      --line: #2a2a32;
+      --accent: #7ea2ff;
+      --card: #17171d;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    padding: 48px 20px 72px;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header { margin-bottom: 40px; }
+  h1 { font-size: 30px; line-height: 1.2; margin: 0 0 6px; letter-spacing: -0.4px; }
+  .role { color: var(--muted); font-size: 15px; margin: 0 0 10px; }
+  .links { font-size: 14px; color: var(--muted); }
+  .links a { margin-right: 14px; }
+  .lede { font-size: 19px; line-height: 1.55; margin: 0 0 32px; }
+  .lede strong { font-weight: 600; }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    margin: 0 0 44px;
+  }
+  .stat { background: var(--card); padding: 16px 14px; }
+  @media (max-width: 560px) {
+    .stats { grid-template-columns: 1fr 1fr; }
+    .stats .stat:last-child:nth-child(odd) { grid-column: 1 / -1; }
+  }
+  .stat .n { font-size: 21px; font-weight: 650; letter-spacing: -0.3px; }
+  .stat .n.wide { font-size: 16px; letter-spacing: -0.1px; white-space: nowrap; }
+  .stat .l { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: var(--muted);
+    font-weight: 600;
+    margin: 44px 0 18px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--line);
+  }
+  .owner { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px 28px; }
+  .owner div { font-size: 15px; }
+  .owner b { font-weight: 600; display: block; font-size: 13px; color: var(--muted); margin-bottom: 1px; }
+  article { margin-bottom: 30px; }
+  article h3 { font-size: 17px; margin: 0 0 6px; letter-spacing: -0.2px; }
+  article p { margin: 0; color: var(--fg); }
+  .note { color: var(--muted); }
+  ul.plain { margin: 0; padding-left: 18px; }
+  ul.plain li { margin-bottom: 8px; }
+  footer {
+    margin-top: 52px;
+    padding-top: 20px;
+    border-top: 1px solid var(--line);
+    font-size: 14px;
+    color: var(--muted);
+  }
+  @media print {
+    body { background: #fff; color: #000; padding: 0; font-size: 11pt; }
+    main { max-width: none; }
+    .stats { break-inside: avoid; }
+    article { break-inside: avoid; }
+    a { color: #000; text-decoration: none; }
+    footer { border-top: 1px solid #ccc; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1>Azizbek Umidjonov</h1>
+  <p class="role">Product engineer — Seoul. I built and run Spiko end to end.</p>
+  <p class="links">
+    <a href="https://github.com/TyposBro">GitHub</a>
+    <a href="https://spiko.uz">spiko.uz</a>
+    <a href="mailto:khasanjonovich@gmail.com">khasanjonovich@gmail.com</a>
+  </p>
+</header>
+
+<p class="lede">
+  Spiko is an AI exam-prep app for the Uzbek market. I wrote the Android app, the iOS app,
+  the serverless backend and the payment integrations, and I still run all of it.
+  <strong>150,000 people registered. About 40,000 used it last month. It pays for itself.</strong>
+</p>
+
+<div class="stats">
+  <div class="stat"><div class="n">150k</div><div class="l">registered users</div></div>
+  <div class="stat"><div class="n">40k</div><div class="l">monthly active</div></div>
+  <div class="stat"><div class="n">100k+</div><div class="l">installs</div></div>
+  <div class="stat"><div class="n">4.8</div><div class="l">stars, Google Play</div></div>
+  <div class="stat"><div class="n wide">Cash-positive</div><div class="l">after inference and fees</div></div>
+</div>
+
+<h2>What I own</h2>
+<div class="owner">
+  <div><b>Client</b>Kotlin and Jetpack Compose on Android, shipped on iOS too</div>
+  <div><b>Backend</b>Cloudflare Workers, Hono, D1, R2, Queues, Durable Objects</div>
+  <div><b>Scale</b>140+ routes, 100+ tables, 35+ scheduled jobs</div>
+  <div><b>Money</b>Three payment providers, subscriptions, reconciliation jobs</div>
+  <div><b>AI</b>Speech grading, feedback and explanation pipelines</div>
+  <div><b>Ops</b>Releases, incident response, support in three languages</div>
+</div>
+
+<h2>Three problems worth your time</h2>
+
+<article>
+  <h3>AI grading at a price a student can pay</h3>
+  <p>
+    The recording goes to a queue; a Durable Object owns the job for that student, with TTL and
+    cleanup so abandoned sessions stop costing money. When the model is slow or over budget, a
+    fallback still returns a usable score. The constraint was never model quality — it was cost per
+    session. A student in Uzbekistan pays in sums, so the margin has to survive inference,
+    platform fees and tax. Closing that loop is what makes the product a business instead of a demo.
+  </p>
+</article>
+
+<article>
+  <h3>Money across three providers</h3>
+  <p>
+    Three payment rails, three webhook shapes, three sets of retry semantics, three settlement
+    lags. Subscriptions are a state machine, webhooks are processed idempotently, and a recovery job
+    picks up the payments that arrive late or twice. Most of the engineering is in the failures:
+    the double charge that should never happen, the subscription that should not silently expire,
+    the user who should not lose access because a callback got lost.
+  </p>
+</article>
+
+<article>
+  <h3>4x growth without a rewrite</h3>
+  <p>
+    The API is versioned and the mobile client can be forced to a version, so a breaking change can
+    ship without waiting for the app store. Feature flags gate what a cohort sees. That is what let
+    the backend move fast while the old clients stayed alive — the backend held an error rate under
+    0.01% through the growth period, and the rewrite everyone expects never became necessary.
+  </p>
+</article>
+
+<h2>What I would do differently</h2>
+<ul class="plain">
+  <li><b>Instrument before shipping.</b> I added real telemetry late and paid for it in guesses. The next product gets an event catalogue and a cost dashboard on day one.</li>
+  <li><b>Test the money paths first.</b> Payment flows got tests after the second incident, not before the first.</li>
+  <li><b>Smaller modules, earlier.</b> I spread logic across layers because it looked professional. It made the mental model expensive. Fewer, deeper modules would have shipped the same product faster.</li>
+</ul>
+
+<h2>Elsewhere</h2>
+<ul class="plain">
+  <li>Brivva — real-time multilingual live commerce in Rust. RTMP ingest, speech-to-text, translation, voice clone, simultaneous fan-out to three platforms. About 21,000 lines in two months; archived when the funding round did not close. <a href="https://github.com/TyposBro/brivva">open source</a>.</li>
+  <li>uzpay — a zero-dependency TypeScript SDK for three Uzbek payment providers, published on npm.</li>
+  <li>Hono — a type-regression fix merged into a 30k-star framework.</li>
+</ul>
+
+<footer>
+  Open to full-time product engineering roles. Seoul, UTC+9 — my evening overlaps US Eastern morning.<br>
+  F-2-7 resident visa with full work rights in Korea. No sponsorship needed. EOR, Korean entity or contractor all workable.
+</footer>
+
+</main>
+</body>
+</html>
