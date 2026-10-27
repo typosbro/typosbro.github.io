@@ -3,7 +3,7 @@ title: Shipping voice AI to cheap Android phones
 key: voice-ai-on-cheap-android
 locale: en
 date: 2026-10-27
-draft: true
+draft: false
 tags: [android, audio, engineering, spiko]
 excerpt: The demo worked on my phone. Then it met Uzbekistan's real phones — old Androids, software encoders, slow mobile data — and the hard part turned out to be getting a recording off the device intact.
 ---
